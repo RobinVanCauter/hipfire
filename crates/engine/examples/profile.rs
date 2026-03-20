@@ -10,9 +10,9 @@ fn main() {
     let gguf = GgufFile::open(Path::new(model_path)).unwrap();
     let config = LlamaConfig::from_gguf(&gguf).unwrap();
     let mut gpu = rdna_compute::Gpu::init().unwrap();
-    let weights = llama::load_weights(&gguf, &config, &gpu).unwrap();
+    let weights = llama::load_weights(&gguf, &config, &mut gpu).unwrap();
     let kv_seq_len = config.max_seq_len.min(2048);
-    let mut kv_cache = KvCache::new_gpu(&gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap();
+    let mut kv_cache = KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap();
 
     // Warmup
     let _ = llama::forward(&mut gpu, &weights, &config, 1, 0, &mut kv_cache);

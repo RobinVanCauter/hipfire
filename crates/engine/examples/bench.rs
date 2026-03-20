@@ -18,10 +18,10 @@ fn main() {
 
     let mut gpu = rdna_compute::Gpu::init().unwrap();
     eprintln!("Loading weights...");
-    let weights = llama::load_weights(&gguf, &config, &gpu).unwrap();
+    let weights = llama::load_weights(&gguf, &config, &mut gpu).unwrap();
 
     let kv_dim = config.n_kv_heads * config.head_dim;
-    let mut kv_cache = KvCache::new_gpu(&gpu, config.n_layers, config.n_kv_heads, config.head_dim, config.max_seq_len).unwrap();
+    let mut kv_cache = KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, config.max_seq_len).unwrap();
 
     // Warmup: 2 tokens
     let _ = llama::forward(&mut gpu, &weights, &config, config.bos_token, 0, &mut kv_cache);

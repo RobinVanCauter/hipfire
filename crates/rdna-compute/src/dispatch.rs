@@ -50,6 +50,7 @@ pub struct Gpu {
     compiler: KernelCompiler,
     modules: HashMap<String, hip_bridge::Module>,
     functions: HashMap<String, hip_bridge::Function>,
+    pool: crate::pool::GpuPool,
 }
 
 impl Gpu {
@@ -68,6 +69,7 @@ impl Gpu {
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),
+            pool: crate::pool::GpuPool::new(),
         })
     }
 
@@ -93,10 +95,10 @@ impl Gpu {
 
     // ── Tensor allocation ───────────────────────────────────────
 
-    pub fn alloc_tensor(&self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
+    pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         let numel: usize = shape.iter().product();
         let byte_size = numel * dtype.size();
-        let buf = self.hip.malloc(byte_size)?;
+        let buf = self.pool.alloc(&self.hip, byte_size)?;
         Ok(GpuTensor {
             buf,
             shape: shape.to_vec(),
@@ -104,7 +106,7 @@ impl Gpu {
         })
     }
 
-    pub fn upload_f32(&self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
+    pub fn upload_f32(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
         let tensor = self.alloc_tensor(shape, DType::F32)?;
         let bytes = unsafe {
             std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
@@ -123,7 +125,7 @@ impl Gpu {
         Ok(data)
     }
 
-    pub fn zeros(&self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
+    pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         let tensor = self.alloc_tensor(shape, dtype)?;
         self.hip.memset(&tensor.buf, 0, tensor.byte_size())?;
         Ok(tensor)
@@ -154,8 +156,9 @@ impl Gpu {
         })
     }
 
-    pub fn free_tensor(&self, tensor: GpuTensor) -> HipResult<()> {
-        self.hip.free(tensor.buf)
+    pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
+        self.pool.free(tensor.buf);
+        Ok(())
     }
 
     // ── Kernel operations ───────────────────────────────────────

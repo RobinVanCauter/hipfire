@@ -68,14 +68,14 @@ fn main() {
     // Load weights
     eprintln!("Loading weights...");
     let t0 = Instant::now();
-    let weights = llama::load_weights(&gguf, &config, &gpu).expect("failed to load weights");
+    let weights = llama::load_weights(&gguf, &config, &mut gpu).expect("failed to load weights");
     eprintln!("  Loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // KV cache
     // Cap KV cache at 2048 positions to save VRAM (enough for inference)
     let kv_seq_len = config.max_seq_len.min(2048);
     let mut kv_cache = KvCache::new_gpu(
-        &gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len,
+        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len,
     ).unwrap();
 
     // Process prompt
