@@ -493,10 +493,10 @@ impl Gpu {
         if k <= 1536 {
             self.ensure_kernel("gemv_q8_0_wide", kernels::GEMV_Q8_0_WIDE_SRC, "gemv_q8_0_wide")?;
             let func = &self.functions["gemv_q8_0_wide"];
-            let block_size = 64u32;
-            let shared_mem = (block_size / 32) * 4; // one float per warp
+            let block_size = 64u32; // 2 warps, each processes one row
+            let grid = ((m + 1) / 2) as u32; // ceil(M/2)
             return unsafe {
-                self.hip.launch_kernel(func, [m as u32, 1, 1], [block_size, 1, 1], shared_mem, None, &mut params)
+                self.hip.launch_kernel(func, [grid, 1, 1], [block_size, 1, 1], 0, None, &mut params)
             };
         }
 
