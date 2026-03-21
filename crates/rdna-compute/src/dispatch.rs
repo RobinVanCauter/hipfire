@@ -474,9 +474,6 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0")?;
-        let func = &self.functions["gemv_q8_0"];
-
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
@@ -491,7 +488,21 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
-        let block_size = 32u32; // single warp — warp shuffle only
+        // Adaptive dispatch: wide kernel for small K (more threads per row),
+        // narrow kernel for large K (more blocks, better occupancy).
+        if k <= 1536 {
+            self.ensure_kernel("gemv_q8_0_wide", kernels::GEMV_Q8_0_WIDE_SRC, "gemv_q8_0_wide")?;
+            let func = &self.functions["gemv_q8_0_wide"];
+            let block_size = 256u32;
+            let shared_mem = (block_size / 32) * 4; // one float per warp
+            return unsafe {
+                self.hip.launch_kernel(func, [m as u32, 1, 1], [block_size, 1, 1], shared_mem, None, &mut params)
+            };
+        }
+
+        self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0")?;
+        let func = &self.functions["gemv_q8_0"];
+        let block_size = 32u32;
         unsafe {
             self.hip.launch_kernel(
                 func,
