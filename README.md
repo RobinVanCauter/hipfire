@@ -33,13 +33,18 @@ All measurements on AMD RX 5700 XT (gfx1010, RDNA1, 8GB GDDR6, 448 GB/s peak).
 
 ```
 TinyLlama 1.1B:
-  Phase 0 baseline:     7.2 tok/s
-  Phase 3 (Q4_K opt):   106.1 tok/s   (14.7x)
-  Phase 4 (Q8 + occ):   198.2 tok/s   (27.5x from baseline, 1.87x from Q4_K)
+  Q8_0 (GGUF):          193 tok/s    (27x from 7.2 baseline)
+  Q4_K_M (GGUF):        109 tok/s
+  llama.cpp Q8_0:        192 tok/s    (parity)
 
 Qwen3 0.6B:
-  GGUF Q8_0:             83.1 tok/s
-  HFQ Q8_FP16:          111.4 tok/s   (1.34x — Q8 lm_head vs F32 tied-embed fallback)
+  Q8_FP16 (HFQ mixed):  108 tok/s
+  Q8_0 (GGUF):           83 tok/s
+
+Qwen3 8B:
+  HFQ mixed (Q8+Q4):     27 tok/s    (Q8 attn + Q4 FFN, fits 8GB VRAM)
+  Q4_K_M (GGUF):         15 tok/s    (Q4K embedding saves 2.1GB)
+  llama.cpp:             OOM          (can't fit with F32 embedding dequant)
 ```
 
 ## Architecture
@@ -66,12 +71,14 @@ hipfire/
 
 ## Supported Models
 
-| Model | Format | VRAM | tok/s |
-|-------|--------|------|-------|
-| TinyLlama 1.1B | Q8_0 (GGUF) | ~1.2 GB | 193 |
-| TinyLlama 1.1B | Q8_FP16 (HFQ) | ~1.2 GB | 198 |
-| TinyLlama 1.1B | Q4_K_M (GGUF) | ~0.6 GB | 109 |
-| Qwen3 0.6B | Q8_FP16 (HFQ) | ~0.9 GB | 111 |
+| Model | Format | VRAM | tok/s | Notes |
+|-------|--------|------|-------|-------|
+| TinyLlama 1.1B | Q8_0 (GGUF) | ~1.2 GB | 193 | Matches llama.cpp |
+| TinyLlama 1.1B | Q4_K_M (GGUF) | ~0.6 GB | 109 | |
+| Qwen3 0.6B | Q8 mixed (HFQ) | ~0.8 GB | 108 | Q8 attn + Q4 FFN |
+| Qwen3 0.6B | Q8_0 (GGUF) | ~0.6 GB | 83 | |
+| **Qwen3 8B** | **Q8 mixed (HFQ)** | **~6.0 GB** | **27** | **Q8 attn + Q4 FFN** |
+| Qwen3 8B | Q4_K_M (GGUF) | ~4.7 GB | 15 | Q4K embedding saves 2.1GB |
 | Qwen3 0.6B | Q8_0 (GGUF) | ~0.6 GB | 83 |
 
 Architectures: LLaMA, Qwen3 (dense). Qwen3.5 (DeltaNet hybrid) is in progress.
