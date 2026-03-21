@@ -349,5 +349,5 @@ pub fn load_weights_hfq(
         layers.push(layer);
     }
 
-    Ok(LlamaWeights { token_embd, output_norm, output, layers })
+    Ok(LlamaWeights { token_embd, token_embd_is_q4k: false, output_norm, output, layers })
 }

@@ -325,13 +325,18 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
 
 /// Determine which tensors to quantize (weight matrices) vs keep as F16 (norms, embeddings)
 fn should_quantize(name: &str) -> bool {
-    // Quantize projection/FFN weight matrices
-    // Keep norms, embeddings, and biases at higher precision
     if name.contains("norm") || name.contains("embed") || name.contains("bias") {
         return false;
     }
-    // Weight matrices: attn projections and FFN
     name.contains("weight")
+}
+
+/// For mixed quant: is this an attention weight (Q8) or FFN weight (Q4)?
+fn is_attention_weight(name: &str) -> bool {
+    name.contains("self_attn") || name.contains("attn_q") || name.contains("attn_k")
+        || name.contains("attn_v") || name.contains("attn_output")
+        || name.contains("q_proj") || name.contains("k_proj")
+        || name.contains("v_proj") || name.contains("o_proj")
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -350,7 +355,9 @@ fn main() {
     let format = args.iter().position(|a| a == "--format")
         .map(|i| args[i + 1].as_str())
         .unwrap_or("q8f16");
+    // q8f16 = all weights Q8, q4f16 = all weights Q4, q8-mixed = Q8 attn + Q4 FFN
     let use_q8 = format == "q8f16" || format == "q8";
+    let use_mixed = format == "q8-mixed" || format == "mixed";
 
     let input_dir = Path::new(input_dir);
     let output_path = Path::new(output_path);
@@ -421,7 +428,14 @@ fn main() {
             let f32_data = to_f32(raw_data, &meta.dtype);
             quantized_params += n_elements as u64;
 
-            let (quantized, qt, gs, label) = if use_q8 {
+            // Choose quant format: Q8 for attn (occupancy), Q4 for FFN (compression)
+            let this_q8 = if use_mixed {
+                is_attention_weight(name) || name.contains("lm_head")
+            } else {
+                use_q8
+            };
+
+            let (quantized, qt, gs, label) = if this_q8 {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_FP16")
             } else {
@@ -435,7 +449,7 @@ fn main() {
             for b in 0..n_blocks {
                 let start = b * block_size;
                 let end = (start + block_size).min(n_elements);
-                if use_q8 {
+                if this_q8 {
                     let off = b * 34;
                     let scale = f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
                     for i in 0..(end - start) {

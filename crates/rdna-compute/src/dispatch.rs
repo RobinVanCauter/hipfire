@@ -147,6 +147,35 @@ impl Gpu {
         self.hip.memcpy_dtod_offset(&output.buf, &table.buf, byte_offset, byte_size)
     }
 
+    /// Q4_K embedding lookup: dequantize one row on GPU, output F32.
+    /// table is raw Q4_K bytes on GPU, output is [dim] F32.
+    pub fn embedding_lookup_q4k(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_id: u32,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("embedding_q4k", kernels::EMBEDDING_Q4K_SRC, "embedding_q4k")?;
+        let func = &self.functions["embedding_q4k"];
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tid = token_id as i32;
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tid as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, None, &mut params)
+        }
+    }
+
     /// Upload raw bytes to GPU (for quantized weights).
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
         let buf = self.hip.malloc(data.len())?;
