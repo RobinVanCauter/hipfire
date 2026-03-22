@@ -110,34 +110,36 @@ fn main() {
         .duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
     if rng_state == 0 { rng_state = 1; }
 
-    // Seed token history with prompt tokens for repeat penalty
     let mut token_history: Vec<u32> = prompt_tokens.clone();
 
-    // Process prompt (with repeat penalty to influence first sampled token)
+    // Process prompt: try batched prefill, fall back to sequential
     let t1 = Instant::now();
-    for (i, (pos, &token)) in prompt_tokens.iter().enumerate().enumerate() {
-        let hist_start = token_history[..i].len().saturating_sub(repeat_window);
-        let hist_slice = &token_history[hist_start..i];
-        if !hist_slice.is_empty() {
-            let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
-            gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
+    let prefill_logits = llama::prefill_forward(
+        &mut gpu, &weights, &config, &prompt_tokens, &mut kv_cache,
+    );
+    let mut next_token = if let Ok(logits) = prefill_logits {
+        let prompt_ms = t1.elapsed().as_millis();
+        eprintln!("Prompt: {}ms ({} tokens, {:.0} tok/s) [batched]",
+            prompt_ms, prompt_tokens.len(),
+            prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0));
+        llama::argmax(&logits)
+    } else {
+        // Fallback: sequential token-at-a-time prefill
+        for (pos, &token) in prompt_tokens.iter().enumerate() {
+            let (_, rng) = llama::forward_scratch(
+                &mut gpu, &weights, &config, token, pos, &mut kv_cache,
+                &scratch, temp.max(0.01), top_p, rng_state, 0, 1.0,
+            ).expect("forward_scratch failed");
+            rng_state = rng;
         }
-        let (_, rng) = llama::forward_scratch(
-            &mut gpu, &weights, &config, token, pos, &mut kv_cache,
-            &scratch, temp.max(0.01), top_p, rng_state,
-            hist_slice.len(), repeat_penalty,
-        ).expect("forward_scratch failed");
-        rng_state = rng;
-    }
-    let prompt_ms = t1.elapsed().as_millis();
-    eprintln!("Prompt: {}ms ({} tokens, {:.0} tok/s)",
-        prompt_ms, prompt_tokens.len(),
-        prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0));
-
-    // Get first token
-    let mut out_bytes = [0u8; 8];
-    gpu.hip.memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf).unwrap();
-    let mut next_token = u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]]);
+        let prompt_ms = t1.elapsed().as_millis();
+        eprintln!("Prompt: {}ms ({} tokens, {:.0} tok/s) [sequential]",
+            prompt_ms, prompt_tokens.len(),
+            prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0));
+        let mut out_bytes = [0u8; 8];
+        gpu.hip.memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf).unwrap();
+        u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]])
+    };
 
     // Generate
     let max_gen = 2048;
