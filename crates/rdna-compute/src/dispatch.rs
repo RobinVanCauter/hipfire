@@ -2112,4 +2112,132 @@ impl Gpu {
             )
         }
     }
+
+    // ── DeltaNet ops (feature-gated) ─────────────────────────────────────
+
+    /// Sigmoid activation, in-place.
+    #[cfg(feature = "deltanet")]
+    pub fn sigmoid_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.ensure_kernel("sigmoid", kernels::SIGMOID_SRC, "sigmoid_f32")?;
+        let func = &self.functions["sigmoid_f32"];
+        let mut xp = x.buf.as_ptr();
+        let mut n = x.numel() as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void, &mut n as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Softplus activation, in-place.
+    #[cfg(feature = "deltanet")]
+    pub fn softplus_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.ensure_kernel("softplus", kernels::SOFTPLUS_SRC, "softplus_f32")?;
+        let func = &self.functions["softplus_f32"];
+        let mut xp = x.buf.as_ptr();
+        let mut n = x.numel() as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void, &mut n as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// L2 normalization per head, in-place. One warp per head.
+    #[cfg(feature = "deltanet")]
+    pub fn l2_norm_f32(&mut self, x: &GpuTensor, n_heads: usize, head_dim: usize, eps: f32) -> HipResult<()> {
+        self.ensure_kernel("l2_norm", kernels::L2_NORM_SRC, "l2_norm_f32")?;
+        let func = &self.functions["l2_norm_f32"];
+        let mut xp = x.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut ep as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// 1D causal conv (kernel_size=4) for decode. Updates ring buffer state.
+    #[cfg(feature = "deltanet")]
+    pub fn conv1d_decode_f32(
+        &mut self, output: &GpuTensor, input: &GpuTensor, weight: &GpuTensor,
+        state: &GpuTensor, n_channels: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("conv1d_decode", kernels::CONV1D_DECODE_SRC, "conv1d_decode_f32")?;
+        let func = &self.functions["conv1d_decode_f32"];
+        let mut op = output.buf.as_ptr();
+        let mut ip = input.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut sp = state.buf.as_ptr();
+        let mut nc = n_channels as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut op as *mut _ as *mut c_void, &mut ip as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n_channels as u32) + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Gated output norm: rmsnorm(x) * silu(z). Fused kernel.
+    #[cfg(feature = "deltanet")]
+    pub fn gated_norm_f32(
+        &mut self, x: &GpuTensor, z: &GpuTensor, weight: &GpuTensor,
+        out: &GpuTensor, n_heads: usize, head_dim: usize, eps: f32,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gated_norm", kernels::GATED_NORM_SRC, "gated_norm_f32")?;
+        let func = &self.functions["gated_norm_f32"];
+        let mut xp = x.buf.as_ptr();
+        let mut zp = z.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void, &mut zp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Gated Delta Net recurrence. S matrix in LDS. Processes all tokens sequentially.
+    #[cfg(feature = "deltanet")]
+    pub fn gated_delta_net_f32(
+        &mut self, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor,
+        gate: &GpuTensor, beta: &GpuTensor,
+        state: &GpuTensor, output: &GpuTensor,
+        n_tokens: usize, n_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gated_delta_net", kernels::GATED_DELTA_NET_SRC, "gated_delta_net_f32")?;
+        let func = &self.functions["gated_delta_net_f32"];
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut gp = gate.buf.as_ptr();
+        let mut bp = beta.buf.as_ptr();
+        let mut sp = state.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void, &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        // 128 threads = 4 warps of 32. One thread per row of S.
+        // Shared memory: 128×128×4 = 64KB for S matrix.
+        let shared = (head_dim * head_dim * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 4, 1], shared, self.stream_ref(), &mut params) }
+    }
 }
