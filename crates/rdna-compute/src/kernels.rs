@@ -175,6 +175,676 @@ extern "C" __global__ void gemv_q4k(
 }
 "#;
 
+/// HFQ4-G128: flat 4-bit with 128-weight groups.
+/// Block: [f32 scale][f32 zero][64B nibbles] = 72 bytes per 128 weights.
+/// Minimal metadata → minimal VGPRs. Hypothesis: ≤32 VGPRs → max occupancy.
+pub const GEMV_HFQ4G128_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_hfq4g128(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 128;
+    const int row_bytes = groups_per_row * 72;
+    const char* row_ptr = A + (long long)row * row_bytes;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 72;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        const unsigned char* nibbles = (const unsigned char*)(gptr + 8);
+
+        // 128 weights / 32 threads = 4 weights per thread
+        int base_idx = g * 128 + tid * 4;
+        int byte_off = tid * 2;
+
+        unsigned char b0 = nibbles[byte_off];
+        unsigned char b1 = nibbles[byte_off + 1];
+
+        float v0 = scale * (float)(b0 & 0xF) + zero;
+        float v1 = scale * (float)(b0 >> 4)  + zero;
+        float v2 = scale * (float)(b1 & 0xF) + zero;
+        float v3 = scale * (float)(b1 >> 4)  + zero;
+
+        acc += v0 * x[base_idx]     + v1 * x[base_idx + 1]
+             + v2 * x[base_idx + 2] + v3 * x[base_idx + 3];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) y[row] = acc;
+}
+"#;
+
+/// HFQ4-G128 batched GEMM: same tiled approach as G256 but 72 bytes/group, 4 weights/thread.
+pub const GEMM_HFQ4G128_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+#define BATCH_TILE 8
+
+__launch_bounds__(32, 16)
+extern "C" __global__ void gemm_hfq4g128(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K, int batch_size
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int batch_start = blockIdx.y * BATCH_TILE;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 128;
+    const int row_bytes = groups_per_row * 72;
+    const char* row_ptr = A + (long long)row * row_bytes;
+
+    int local_bs = batch_size - batch_start;
+    if (local_bs > BATCH_TILE) local_bs = BATCH_TILE;
+    if (local_bs <= 0) return;
+
+    float acc[BATCH_TILE];
+    for (int b = 0; b < BATCH_TILE; b++) acc[b] = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 72;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        const unsigned char* nibbles = (const unsigned char*)(gptr + 8);
+
+        int base_k = g * 128 + tid * 4;
+        int byte_off = tid * 2;
+
+        unsigned char b0 = nibbles[byte_off];
+        unsigned char b1 = nibbles[byte_off + 1];
+
+        float w0 = scale * (float)(b0 & 0xF) + zero;
+        float w1 = scale * (float)(b0 >> 4)  + zero;
+        float w2 = scale * (float)(b1 & 0xF) + zero;
+        float w3 = scale * (float)(b1 >> 4)  + zero;
+
+        for (int b = 0; b < local_bs; b++) {
+            const float* xb = x + (batch_start + b) * K;
+            acc[b] += w0 * xb[base_k]     + w1 * xb[base_k + 1]
+                    + w2 * xb[base_k + 2] + w3 * xb[base_k + 3];
+        }
+    }
+
+    for (int b = 0; b < local_bs; b++) {
+        float val = acc[b];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            val += __shfl_down(val, offset);
+        if (tid == 0) y[(batch_start + b) * M + row] = val;
+    }
+}
+"#;
+
+/// HFQ2-G256: flat 2-bit with 256-weight groups.
+/// Block: [f32 scale][f32 zero][64B data] = 72 bytes per 256 weights (0.28 B/w).
+pub const GEMV_HFQ2G256_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_hfq2g256(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 256;
+    const int row_bytes = groups_per_row * 72;
+    const char* row_ptr = A + (long long)row * row_bytes;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 72;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        const unsigned char* data = (const unsigned char*)(gptr + 8);
+
+        // 256 weights / 32 threads = 8 weights per thread = 2 bytes (4 weights/byte at 2-bit)
+        int base_idx = g * 256 + tid * 8;
+        int byte_off = tid * 2;
+
+        unsigned char b0 = data[byte_off];
+        unsigned char b1 = data[byte_off + 1];
+
+        acc += (scale * (float)(b0 & 3)       + zero) * x[base_idx]
+             + (scale * (float)((b0 >> 2) & 3) + zero) * x[base_idx + 1]
+             + (scale * (float)((b0 >> 4) & 3) + zero) * x[base_idx + 2]
+             + (scale * (float)(b0 >> 6)       + zero) * x[base_idx + 3]
+             + (scale * (float)(b1 & 3)        + zero) * x[base_idx + 4]
+             + (scale * (float)((b1 >> 2) & 3) + zero) * x[base_idx + 5]
+             + (scale * (float)((b1 >> 4) & 3) + zero) * x[base_idx + 6]
+             + (scale * (float)(b1 >> 6)       + zero) * x[base_idx + 7];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) y[row] = acc;
+}
+"#;
+
+/// HFQ8-G256: flat 8-bit with 256-weight groups.
+/// Block: [f32 scale][f32 zero][256B data] = 264 bytes per 256 weights (1.03 B/w).
+pub const GEMV_HFQ8G256_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_hfq8g256(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 256;
+    const int row_bytes = groups_per_row * 264;
+    const char* row_ptr = A + (long long)row * row_bytes;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 264;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        const unsigned char* data = (const unsigned char*)(gptr + 8);
+
+        // 256 weights / 32 threads = 8 weights per thread = 8 bytes
+        int base_idx = g * 256 + tid * 8;
+        int byte_off = tid * 8;
+
+        acc += (scale * (float)data[byte_off]     + zero) * x[base_idx]
+             + (scale * (float)data[byte_off + 1] + zero) * x[base_idx + 1]
+             + (scale * (float)data[byte_off + 2] + zero) * x[base_idx + 2]
+             + (scale * (float)data[byte_off + 3] + zero) * x[base_idx + 3]
+             + (scale * (float)data[byte_off + 4] + zero) * x[base_idx + 4]
+             + (scale * (float)data[byte_off + 5] + zero) * x[base_idx + 5]
+             + (scale * (float)data[byte_off + 6] + zero) * x[base_idx + 6]
+             + (scale * (float)data[byte_off + 7] + zero) * x[base_idx + 7];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) y[row] = acc;
+}
+"#;
+
+/// HFQ6-G256: flat 6-bit with 256-weight groups.
+/// Block: [f32 scale][f32 zero][192B data] = 200 bytes per 256 weights (0.78 B/w).
+/// Packing: 4 weights per 3 bytes (24 bits = 4×6 bits).
+pub const GEMV_HFQ6G256_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_hfq6g256(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 256;
+    const int row_bytes = groups_per_row * 200;
+    const char* row_ptr = A + (long long)row * row_bytes;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 200;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        const unsigned char* data = (const unsigned char*)(gptr + 8);
+
+        // 256 weights / 32 threads = 8 weights per thread
+        // 4 weights per 3 bytes → 8 weights = 6 bytes per thread
+        int base_idx = g * 256 + tid * 8;
+        int byte_off = tid * 6;
+
+        unsigned char b0 = data[byte_off];
+        unsigned char b1 = data[byte_off + 1];
+        unsigned char b2 = data[byte_off + 2];
+        unsigned char b3 = data[byte_off + 3];
+        unsigned char b4 = data[byte_off + 4];
+        unsigned char b5 = data[byte_off + 5];
+
+        // 4 weights from first 3 bytes
+        int q0 = b0 & 63;
+        int q1 = (b0 >> 6) | ((b1 & 0xF) << 2);
+        int q2 = (b1 >> 4) | ((b2 & 3) << 4);
+        int q3 = b2 >> 2;
+        // 4 weights from next 3 bytes
+        int q4 = b3 & 63;
+        int q5 = (b3 >> 6) | ((b4 & 0xF) << 2);
+        int q6 = (b4 >> 4) | ((b5 & 3) << 4);
+        int q7 = b5 >> 2;
+
+        acc += (scale * (float)q0 + zero) * x[base_idx]
+             + (scale * (float)q1 + zero) * x[base_idx + 1]
+             + (scale * (float)q2 + zero) * x[base_idx + 2]
+             + (scale * (float)q3 + zero) * x[base_idx + 3]
+             + (scale * (float)q4 + zero) * x[base_idx + 4]
+             + (scale * (float)q5 + zero) * x[base_idx + 5]
+             + (scale * (float)q6 + zero) * x[base_idx + 6]
+             + (scale * (float)q7 + zero) * x[base_idx + 7];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) y[row] = acc;
+}
+"#;
+
+/// HFQ3-G256: flat 3-bit with 256-weight groups.
+/// Block: [f32 scale][f32 zero][96B data] = 104 bytes per 256 weights (0.41 B/w).
+/// Packing: 8 weights per 3 bytes (24 bits = 8×3 bits).
+pub const GEMV_HFQ3G256_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_hfq3g256(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 256;
+    const int row_bytes = groups_per_row * 104;
+    const char* row_ptr = A + (long long)row * row_bytes;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 104;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        const unsigned char* data = (const unsigned char*)(gptr + 8);
+
+        // 256 weights / 32 threads = 8 weights per thread
+        // 8 weights × 3 bits = 24 bits = 3 bytes per thread
+        int base_idx = g * 256 + tid * 8;
+        int byte_off = tid * 3;
+
+        unsigned char b0 = data[byte_off];
+        unsigned char b1 = data[byte_off + 1];
+        unsigned char b2 = data[byte_off + 2];
+
+        // Unpack 8 × 3-bit from 24 bits
+        int q0 = b0 & 7;
+        int q1 = (b0 >> 3) & 7;
+        int q2 = ((b0 >> 6) | (b1 << 2)) & 7;
+        int q3 = (b1 >> 1) & 7;
+        int q4 = (b1 >> 4) & 7;
+        int q5 = ((b1 >> 7) | (b2 << 1)) & 7;
+        int q6 = (b2 >> 2) & 7;
+        int q7 = (b2 >> 5) & 7;
+
+        acc += (scale * (float)q0 + zero) * x[base_idx]
+             + (scale * (float)q1 + zero) * x[base_idx + 1]
+             + (scale * (float)q2 + zero) * x[base_idx + 2]
+             + (scale * (float)q3 + zero) * x[base_idx + 3]
+             + (scale * (float)q4 + zero) * x[base_idx + 4]
+             + (scale * (float)q5 + zero) * x[base_idx + 5]
+             + (scale * (float)q6 + zero) * x[base_idx + 6]
+             + (scale * (float)q7 + zero) * x[base_idx + 7];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) y[row] = acc;
+}
+"#;
+
+/// HFQ4-G512: flat 4-bit with 512-weight groups.
+/// Block: [f32 scale][f32 zero][256B nibbles] = 264 bytes per 512 weights (0.516 B/w).
+/// 264B ≈ 1 PCIe TLP, 2 L2 cache lines.
+pub const GEMV_HFQ4G512_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_hfq4g512(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 512;
+    const int row_bytes = groups_per_row * 264;
+    const char* row_ptr = A + (long long)row * row_bytes;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 264;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        const unsigned char* nibbles = (const unsigned char*)(gptr + 8);
+
+        // 512 weights / 32 threads = 16 weights per thread = 8 bytes
+        int base_idx = g * 512 + tid * 16;
+        int byte_off = tid * 8;
+
+        unsigned char b0 = nibbles[byte_off];
+        unsigned char b1 = nibbles[byte_off + 1];
+        unsigned char b2 = nibbles[byte_off + 2];
+        unsigned char b3 = nibbles[byte_off + 3];
+        unsigned char b4 = nibbles[byte_off + 4];
+        unsigned char b5 = nibbles[byte_off + 5];
+        unsigned char b6 = nibbles[byte_off + 6];
+        unsigned char b7 = nibbles[byte_off + 7];
+
+        acc += (scale * (float)(b0 & 0xF) + zero) * x[base_idx]
+             + (scale * (float)(b0 >> 4)  + zero) * x[base_idx + 1]
+             + (scale * (float)(b1 & 0xF) + zero) * x[base_idx + 2]
+             + (scale * (float)(b1 >> 4)  + zero) * x[base_idx + 3]
+             + (scale * (float)(b2 & 0xF) + zero) * x[base_idx + 4]
+             + (scale * (float)(b2 >> 4)  + zero) * x[base_idx + 5]
+             + (scale * (float)(b3 & 0xF) + zero) * x[base_idx + 6]
+             + (scale * (float)(b3 >> 4)  + zero) * x[base_idx + 7]
+             + (scale * (float)(b4 & 0xF) + zero) * x[base_idx + 8]
+             + (scale * (float)(b4 >> 4)  + zero) * x[base_idx + 9]
+             + (scale * (float)(b5 & 0xF) + zero) * x[base_idx + 10]
+             + (scale * (float)(b5 >> 4)  + zero) * x[base_idx + 11]
+             + (scale * (float)(b6 & 0xF) + zero) * x[base_idx + 12]
+             + (scale * (float)(b6 >> 4)  + zero) * x[base_idx + 13]
+             + (scale * (float)(b7 & 0xF) + zero) * x[base_idx + 14]
+             + (scale * (float)(b7 >> 4)  + zero) * x[base_idx + 15];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) y[row] = acc;
+}
+"#;
+
+/// HFQ4-G1024: flat 4-bit with 1024-weight groups.
+/// Block: [f32 scale][f32 zero][512B nibbles] = 520 bytes per 1024 weights (0.508 B/w).
+pub const GEMV_HFQ4G1024_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_hfq4g1024(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 1024;
+    const int row_bytes = groups_per_row * 520;
+    const char* row_ptr = A + (long long)row * row_bytes;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 520;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        const unsigned char* nibbles = (const unsigned char*)(gptr + 8);
+
+        // 1024 weights / 32 threads = 32 weights per thread = 16 bytes
+        // Process in 2 halves to limit register pressure
+        int base_idx = g * 1024 + tid * 32;
+        int byte_off = tid * 16;
+
+        for (int h = 0; h < 2; h++) {
+            unsigned char b0 = nibbles[byte_off + h * 8];
+            unsigned char b1 = nibbles[byte_off + h * 8 + 1];
+            unsigned char b2 = nibbles[byte_off + h * 8 + 2];
+            unsigned char b3 = nibbles[byte_off + h * 8 + 3];
+            unsigned char b4 = nibbles[byte_off + h * 8 + 4];
+            unsigned char b5 = nibbles[byte_off + h * 8 + 5];
+            unsigned char b6 = nibbles[byte_off + h * 8 + 6];
+            unsigned char b7 = nibbles[byte_off + h * 8 + 7];
+            int bi = base_idx + h * 16;
+
+            acc += (scale * (float)(b0 & 0xF) + zero) * x[bi]
+                 + (scale * (float)(b0 >> 4)  + zero) * x[bi + 1]
+                 + (scale * (float)(b1 & 0xF) + zero) * x[bi + 2]
+                 + (scale * (float)(b1 >> 4)  + zero) * x[bi + 3]
+                 + (scale * (float)(b2 & 0xF) + zero) * x[bi + 4]
+                 + (scale * (float)(b2 >> 4)  + zero) * x[bi + 5]
+                 + (scale * (float)(b3 & 0xF) + zero) * x[bi + 6]
+                 + (scale * (float)(b3 >> 4)  + zero) * x[bi + 7]
+                 + (scale * (float)(b4 & 0xF) + zero) * x[bi + 8]
+                 + (scale * (float)(b4 >> 4)  + zero) * x[bi + 9]
+                 + (scale * (float)(b5 & 0xF) + zero) * x[bi + 10]
+                 + (scale * (float)(b5 >> 4)  + zero) * x[bi + 11]
+                 + (scale * (float)(b6 & 0xF) + zero) * x[bi + 12]
+                 + (scale * (float)(b6 >> 4)  + zero) * x[bi + 13]
+                 + (scale * (float)(b7 & 0xF) + zero) * x[bi + 14]
+                 + (scale * (float)(b7 >> 4)  + zero) * x[bi + 15];
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) y[row] = acc;
+}
+"#;
+
+/// HFQ4-G256: flat 4-bit with 256-weight groups.
+/// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 weights.
+/// Same coalesced width as Q4_K, 14 VGPRs instead of 39.
+pub const GEMV_HFQ4G256_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_hfq4g256(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 256;
+    const int row_bytes = groups_per_row * 136;
+    const char* row_ptr = A + (long long)row * row_bytes;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 136;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        const unsigned char* nibbles = (const unsigned char*)(gptr + 8);
+
+        // 256 weights / 32 threads = 8 weights per thread = 4 bytes
+        int base_idx = g * 256 + tid * 8;
+        int byte_off = tid * 4;
+
+        unsigned char b0 = nibbles[byte_off];
+        unsigned char b1 = nibbles[byte_off + 1];
+        unsigned char b2 = nibbles[byte_off + 2];
+        unsigned char b3 = nibbles[byte_off + 3];
+
+        acc += (scale * (float)(b0 & 0xF) + zero) * x[base_idx]
+             + (scale * (float)(b0 >> 4)  + zero) * x[base_idx + 1]
+             + (scale * (float)(b1 & 0xF) + zero) * x[base_idx + 2]
+             + (scale * (float)(b1 >> 4)  + zero) * x[base_idx + 3]
+             + (scale * (float)(b2 & 0xF) + zero) * x[base_idx + 4]
+             + (scale * (float)(b2 >> 4)  + zero) * x[base_idx + 5]
+             + (scale * (float)(b3 & 0xF) + zero) * x[base_idx + 6]
+             + (scale * (float)(b3 >> 4)  + zero) * x[base_idx + 7];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) y[row] = acc;
+}
+"#;
+
+/// HFQ4-G256 wide GEMV: 2 rows per block (64 threads = 2 warps).
+/// Each warp processes one row independently. Halves grid size.
+pub const GEMV_HFQ4G256_WIDE_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void gemv_hfq4g256_wide(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane = tid & 31;
+    const int row = blockIdx.x * 2 + warp_id;
+    if (row >= M) return;
+
+    const int groups_per_row = K / 256;
+    const int row_bytes = groups_per_row * 136;
+    const char* row_ptr = A + (long long)row * row_bytes;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 136;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        const unsigned char* nibbles = (const unsigned char*)(gptr + 8);
+
+        int base_idx = g * 256 + lane * 8;
+        int byte_off = lane * 4;
+
+        unsigned char b0 = nibbles[byte_off];
+        unsigned char b1 = nibbles[byte_off + 1];
+        unsigned char b2 = nibbles[byte_off + 2];
+        unsigned char b3 = nibbles[byte_off + 3];
+
+        acc += (scale * (float)(b0 & 0xF) + zero) * x[base_idx]
+             + (scale * (float)(b0 >> 4)  + zero) * x[base_idx + 1]
+             + (scale * (float)(b1 & 0xF) + zero) * x[base_idx + 2]
+             + (scale * (float)(b1 >> 4)  + zero) * x[base_idx + 3]
+             + (scale * (float)(b2 & 0xF) + zero) * x[base_idx + 4]
+             + (scale * (float)(b2 >> 4)  + zero) * x[base_idx + 5]
+             + (scale * (float)(b3 & 0xF) + zero) * x[base_idx + 6]
+             + (scale * (float)(b3 >> 4)  + zero) * x[base_idx + 7];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (lane == 0) y[row] = acc;
+}
+"#;
+
+/// HFQ4-G256 batched GEMM: y[batch][row] = sum_k(A[row][k] * x[batch][k])
+/// Loads weight data ONCE per group, multiplies against BATCH_TILE input vectors.
+/// Grid: [M, ceil(batch_size/BATCH_TILE), 1]. Each block handles one row × BATCH_TILE batch elements.
+/// x layout: [batch_size × K] row-major. y layout: [batch_size × M] row-major.
+/// BATCH_TILE=8 keeps register pressure at ~26 VGPRs for good occupancy on RDNA.
+pub const GEMM_HFQ4G256_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+#define BATCH_TILE 8
+
+__launch_bounds__(32, 16)
+extern "C" __global__ void gemm_hfq4g256(
+    const char* __restrict__ A,
+    const float* __restrict__ x,    // [batch_size, K]
+    float* __restrict__ y,          // [batch_size, M]
+    int M, int K, int batch_size
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int batch_start = blockIdx.y * BATCH_TILE;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 256;
+    const int row_bytes = groups_per_row * 136;
+    const char* row_ptr = A + (long long)row * row_bytes;
+
+    // How many batch elements this block handles
+    int local_bs = batch_size - batch_start;
+    if (local_bs > BATCH_TILE) local_bs = BATCH_TILE;
+    if (local_bs <= 0) return;
+
+    float acc[BATCH_TILE];
+    for (int b = 0; b < BATCH_TILE; b++) acc[b] = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 136;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        const unsigned char* nibbles = (const unsigned char*)(gptr + 8);
+
+        int base_k = g * 256 + tid * 8;
+        int byte_off = tid * 4;
+
+        unsigned char b0 = nibbles[byte_off];
+        unsigned char b1 = nibbles[byte_off + 1];
+        unsigned char b2 = nibbles[byte_off + 2];
+        unsigned char b3 = nibbles[byte_off + 3];
+
+        float w0 = scale * (float)(b0 & 0xF) + zero;
+        float w1 = scale * (float)(b0 >> 4)  + zero;
+        float w2 = scale * (float)(b1 & 0xF) + zero;
+        float w3 = scale * (float)(b1 >> 4)  + zero;
+        float w4 = scale * (float)(b2 & 0xF) + zero;
+        float w5 = scale * (float)(b2 >> 4)  + zero;
+        float w6 = scale * (float)(b3 & 0xF) + zero;
+        float w7 = scale * (float)(b3 >> 4)  + zero;
+
+        for (int b = 0; b < local_bs; b++) {
+            const float* xb = x + (batch_start + b) * K;
+            acc[b] += w0 * xb[base_k]     + w1 * xb[base_k + 1]
+                    + w2 * xb[base_k + 2] + w3 * xb[base_k + 3]
+                    + w4 * xb[base_k + 4] + w5 * xb[base_k + 5]
+                    + w6 * xb[base_k + 6] + w7 * xb[base_k + 7];
+        }
+    }
+
+    for (int b = 0; b < local_bs; b++) {
+        float val = acc[b];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            val += __shfl_down(val, offset);
+        if (tid == 0) y[(batch_start + b) * M + row] = val;
+    }
+}
+"#;
+
 /// Fused QKV Q4_K: three GEMVs in one kernel launch.
 /// Grid = (q_m + k_m + v_m) blocks. Each block determines which matrix by blockIdx range.
 /// All three projections read the same input x (cached). Saves 2 kernel launches per layer.
@@ -685,7 +1355,7 @@ pub const ROPE_SRC: &str = r#"
 extern "C" __global__ void rope_f32(
     float* __restrict__ q,
     float* __restrict__ k,
-    int pos,
+    const int* __restrict__ pos_buf,
     int n_heads_q,
     int n_heads_k,
     int head_dim,
@@ -695,6 +1365,7 @@ extern "C" __global__ void rope_f32(
     int half = head_dim / 2;
     if (i >= half) return;
 
+    int pos = pos_buf[0];
     float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
     float val = (float)pos * freq;
     float cos_val = cosf(val);
@@ -718,6 +1389,55 @@ extern "C" __global__ void rope_f32(
 }
 "#;
 
+/// Batched RoPE: apply RoPE to [batch_size] positions at once.
+/// q: [batch_size × n_heads_q × head_dim], k: [batch_size × n_heads_k × head_dim]
+/// positions: [batch_size] int array of position indices.
+/// Grid: [half, batch_size, 1]. Each thread handles one (position, freq_index) pair.
+pub const ROPE_BATCHED_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void rope_batched_f32(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const int* __restrict__ positions,  // [batch_size]
+    int n_heads_q,
+    int n_heads_k,
+    int head_dim,
+    float freq_base,
+    int batch_size
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;  // freq index
+    int b = blockIdx.y;  // batch index
+    int half = head_dim / 2;
+    if (i >= half || b >= batch_size) return;
+
+    int pos = positions[b];
+    float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
+    float val = (float)pos * freq;
+    float cos_val = cosf(val);
+    float sin_val = sinf(val);
+
+    int q_stride = n_heads_q * head_dim;
+    int k_stride = n_heads_k * head_dim;
+
+    for (int h = 0; h < n_heads_q; h++) {
+        int base = b * q_stride + h * head_dim;
+        float q0 = q[base + i];
+        float q1 = q[base + i + half];
+        q[base + i]        = q0 * cos_val - q1 * sin_val;
+        q[base + i + half] = q0 * sin_val + q1 * cos_val;
+    }
+
+    for (int h = 0; h < n_heads_k; h++) {
+        int base = b * k_stride + h * head_dim;
+        float k0 = k[base + i];
+        float k1 = k[base + i + half];
+        k[base + i]        = k0 * cos_val - k1 * sin_val;
+        k[base + i + half] = k0 * sin_val + k1 * cos_val;
+    }
+}
+"#;
+
 /// Single-head causal attention on GPU.
 /// One thread block per query head. Handles GQA (kv_group heads share same KV).
 /// q: [n_heads * head_dim], k_cache: [seq_len * n_kv_heads * head_dim],
@@ -730,13 +1450,14 @@ extern "C" __global__ void attention_f32(
     const float* __restrict__ k_cache,    // [max_seq * n_kv_heads * head_dim]
     const float* __restrict__ v_cache,    // [max_seq * n_kv_heads * head_dim]
     float* __restrict__ out,              // [n_heads * head_dim]
-    int seq_len,        // number of positions cached (including current)
+    const int* __restrict__ pos_buf,      // GPU buffer: seq_len = pos_buf[0] + 1
     int n_heads,
     int n_kv_heads,
     int head_dim,
     int max_seq,        // max sequence length (stride for cache indexing)
     float scale         // 1/sqrt(head_dim)
 ) {
+    int seq_len = pos_buf[0] + 1;
     extern __shared__ float sdata[];
 
     const int h = blockIdx.x;  // query head index
@@ -814,6 +1535,1524 @@ extern "C" __global__ void attention_f32(
 }
 "#;
 
+/// Flash-Decoding attention: split KV scan across multiple blocks per head.
+/// Phase 1: each block processes a chunk of KV positions, writes partial (max, sum, output).
+/// Phase 2: reduction across chunks using online softmax correction.
+/// Grid: [n_heads, n_chunks, 1]. Each block handles one (head, chunk) pair.
+/// Partial results stored in partials buffer: [n_heads × n_chunks × (1 + 1 + head_dim)] floats.
+pub const ATTENTION_FLASH_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_flash_partial(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float* __restrict__ partials,       // [n_heads, n_chunks, 2 + head_dim]
+    int seq_len,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale,
+    int chunk_size
+) {
+    const int h = blockIdx.x;
+    const int chunk_id = blockIdx.y;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int chunk_start = chunk_id * chunk_size;
+    int chunk_end = chunk_start + chunk_size;
+    if (chunk_end > seq_len) chunk_end = seq_len;
+    if (chunk_start >= seq_len) return;
+    const int chunk_len = chunk_end - chunk_start;
+
+    const float* q_head = q + h * head_dim;
+
+    // Compute scores for this chunk
+    extern __shared__ float sdata[];
+    float* scores = sdata;  // [chunk_size]
+
+    float local_max = -1e30f;
+    for (int t = tid; t < chunk_len; t += nthreads) {
+        int pos = chunk_start + t;
+        const float* k_t = k_cache + pos * n_kv_heads * head_dim + kv_h * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += q_head[d] * k_t[d];
+        }
+        float s = dot * scale;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    // Reduce max
+    float* ws = sdata + chunk_size;
+    ws[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid + s]);
+        __syncthreads();
+    }
+    float max_val = ws[0];
+    __syncthreads();
+
+    // Exp + sum
+    float local_sum = 0.0f;
+    for (int t = tid; t < chunk_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    ws[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) ws[tid] += ws[tid + s];
+        __syncthreads();
+    }
+    float sum_val = ws[0];
+    __syncthreads();
+
+    // Weighted sum of values for this chunk
+    int n_chunks = gridDim.y;
+    int partial_stride = 2 + head_dim;  // [max, sum, output[head_dim]]
+    float* partial = partials + (h * n_chunks + chunk_id) * partial_stride;
+
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int t = 0; t < chunk_len; t++) {
+            val += scores[t] * v_cache[(chunk_start + t) * n_kv_heads * head_dim + kv_h * head_dim + d];
+        }
+        partial[2 + d] = val;  // unnormalized weighted sum
+    }
+    if (tid == 0) {
+        partial[0] = max_val;
+        partial[1] = sum_val;
+    }
+}
+
+// Phase 2: reduce partials across chunks using online softmax correction
+extern "C" __global__ void attention_flash_reduce(
+    const float* __restrict__ partials,
+    float* __restrict__ out,
+    int n_heads,
+    int n_chunks,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int tid = threadIdx.x;
+
+    int partial_stride = 2 + head_dim;
+
+    // Online softmax: combine chunks
+    float global_max = -1e30f;
+    float global_sum = 0.0f;
+
+    // First pass: find global max
+    for (int c = 0; c < n_chunks; c++) {
+        const float* p = partials + (h * n_chunks + c) * partial_stride;
+        float m = p[0];
+        if (m > global_max) global_max = m;
+    }
+
+    // Second pass: compute corrected sum and weighted output
+    float* out_head = out + h * head_dim;
+    // Initialize output to zero
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        out_head[d] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int c = 0; c < n_chunks; c++) {
+        const float* p = partials + (h * n_chunks + c) * partial_stride;
+        float chunk_max = p[0];
+        float chunk_sum = p[1];
+        float correction = expf(chunk_max - global_max);
+        float corrected_sum = chunk_sum * correction;
+        global_sum += corrected_sum;
+
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            out_head[d] += p[2 + d] * correction;
+        }
+        __syncthreads();
+    }
+
+    // Final normalize
+    float inv_sum = 1.0f / global_sum;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        out_head[d] *= inv_sum;
+    }
+}
+"#;
+
+/// Fused Gate+Up HFQ4-G256: two GEMVs in one launch (saves 1 launch per layer).
+/// Grid: [gate_m + up_m, 1, 1]. Each block processes one row from gate or up weight.
+pub const FUSED_GATE_UP_HFQ4G256_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void fused_gate_up_hfq4g256(
+    const char* __restrict__ A_gate,
+    const char* __restrict__ A_up,
+    const float* __restrict__ x,
+    float* __restrict__ y_gate,
+    float* __restrict__ y_up,
+    int gate_m, int up_m, int K
+) {
+    const int gid = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const char* A;
+    float* y;
+    int local_row;
+    if (gid < gate_m) {
+        A = A_gate; y = y_gate; local_row = gid;
+    } else {
+        A = A_up; y = y_up; local_row = gid - gate_m;
+    }
+
+    const int groups_per_row = K / 256;
+    const int row_bytes = groups_per_row * 136;
+    const char* row_ptr = A + (long long)local_row * row_bytes;
+
+    float acc = 0.0f;
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 136;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        const unsigned char* nibbles = (const unsigned char*)(gptr + 8);
+        int base_idx = g * 256 + tid * 8;
+        int byte_off = tid * 4;
+        unsigned char b0 = nibbles[byte_off];
+        unsigned char b1 = nibbles[byte_off + 1];
+        unsigned char b2 = nibbles[byte_off + 2];
+        unsigned char b3 = nibbles[byte_off + 3];
+        acc += (scale * (float)(b0 & 0xF) + zero) * x[base_idx]
+             + (scale * (float)(b0 >> 4)  + zero) * x[base_idx + 1]
+             + (scale * (float)(b1 & 0xF) + zero) * x[base_idx + 2]
+             + (scale * (float)(b1 >> 4)  + zero) * x[base_idx + 3]
+             + (scale * (float)(b2 & 0xF) + zero) * x[base_idx + 4]
+             + (scale * (float)(b2 >> 4)  + zero) * x[base_idx + 5]
+             + (scale * (float)(b3 & 0xF) + zero) * x[base_idx + 6]
+             + (scale * (float)(b3 >> 4)  + zero) * x[base_idx + 7];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+    if (tid == 0) y[local_row] = acc;
+}
+"#;
+
+/// INT8 co-located KV v2: [f16 scale (2B)][padding (2B)][int8 × head_dim] = 132 bytes per head.
+/// f16 scale matches Q8_0 but with one block per head. Padding for 4-byte alignment.
+pub const KV_CACHE_WRITE_INT8C_F16_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void kv_cache_write_int8c_f16(
+    unsigned char* __restrict__ dst,
+    const float* __restrict__ src,
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;
+    const int pos = pos_buf[0];
+    const float* head_src = src + h * head_dim;
+
+    float amax = 0.0f;
+    for (int i = tid; i < head_dim; i += 32)
+        amax = fmaxf(amax, fabsf(head_src[i]));
+    for (int o = 16; o > 0; o >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, o));
+
+    float scale = amax / 127.0f;
+    float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+    // Block: [2B f16 scale][2B pad][head_dim × int8] = 4 + head_dim bytes
+    int bph = 4 + head_dim;
+    int bpp = n_kv_heads * bph;
+    unsigned char* out = dst + (size_t)pos * bpp + h * bph;
+
+    if (tid == 0) {
+        *((_Float16*)(out)) = (_Float16)scale;
+        out[2] = 0; out[3] = 0;  // padding
+    }
+
+    for (int i = tid; i < head_dim; i += 32) {
+        int q = __float2int_rn(head_src[i] * inv);
+        out[4 + i] = (unsigned char)(signed char)(q > 127 ? 127 : (q < -127 ? -127 : q));
+    }
+}
+"#;
+
+/// Attention with INT8 co-located f16 scale KV.
+pub const ATTENTION_INT8C_F16_KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_int8c_f16_kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const float* q_head = q + h * head_dim;
+    const int bph = 4 + head_dim;
+    const int bpp = n_kv_heads * bph;
+    float* scores = sdata;
+    float* ws = sdata + seq_len;
+
+    float lmax = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* blk = k_cache + (size_t)t * bpp + kv_h * bph;
+        float sc = (float)*(const _Float16*)(blk);
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q_head[d] * (sc * (float)((signed char)blk[4 + d]));
+        scores[t] = dot * scale_attn;
+        lmax = fmaxf(lmax, scores[t]);
+    }
+    ws[tid] = lmax;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid + s]); __syncthreads(); }
+    float max_val = ws[0]; __syncthreads();
+
+    float lsum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) { float e = expf(scores[t] - max_val); scores[t] = e; lsum += e; }
+    ws[tid] = lsum; __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] += ws[tid + s]; __syncthreads(); }
+    float sum_val = ws[0]; __syncthreads();
+    for (int t = tid; t < seq_len; t += nthreads) scores[t] /= sum_val;
+    __syncthreads();
+
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int t = 0; t < seq_len; t++) {
+            const unsigned char* blk = v_cache + (size_t)t * bpp + kv_h * bph;
+            float sc = (float)*(const _Float16*)(blk);
+            val += scores[t] * (sc * (float)((signed char)blk[4 + d]));
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
+/// INT8 co-located KV: [f32 scale][int8 × head_dim] = 132 bytes per head.
+/// Symmetric quantization, no zero point. Dequant: scale * (float)val.
+/// Minimized VGPRs: no zero register, no nibble math.
+pub const KV_CACHE_WRITE_INT8C_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void kv_cache_write_int8c(
+    unsigned char* __restrict__ dst,
+    const float* __restrict__ src,
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;
+    const int pos = pos_buf[0];
+    const float* head_src = src + h * head_dim;
+
+    float amax = 0.0f;
+    for (int i = tid; i < head_dim; i += 32)
+        amax = fmaxf(amax, fabsf(head_src[i]));
+    for (int o = 16; o > 0; o >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, o));
+
+    float scale = amax / 127.0f;
+    float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+    // Padded to 8 + head_dim bytes (136 for head_dim=128) for cache line alignment
+    int bph = 8 + head_dim;  // 8-byte header (scale + 4 pad) + data
+    int bpp = n_kv_heads * bph;
+    unsigned char* out = dst + (size_t)pos * bpp + h * bph;
+
+    if (tid == 0) {
+        *(float*)(out) = scale;
+        *(unsigned int*)(out + 4) = 0;  // padding
+    }
+
+    for (int i = tid; i < head_dim; i += 32) {
+        int q = __float2int_rn(head_src[i] * inv);
+        out[8 + i] = (unsigned char)(signed char)(q > 127 ? 127 : (q < -127 ? -127 : q));
+    }
+}
+"#;
+
+/// Attention with INT8 co-located KV. Deferred scale multiply, 4×32 unrolled inner loop.
+/// Q preloaded into shared memory. Scale applied ONCE per position, not per element.
+pub const ATTENTION_INT8C_KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_int8c_kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int bph = 8 + head_dim;  // 8-byte header (scale + pad) + data
+    const int bpp = n_kv_heads * bph;
+
+    float* scores = sdata;
+    float* ws = sdata + seq_len;
+    float* q_sh = ws + nthreads;
+
+    // Preload Q into shared memory
+    const float* q_head = q + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_sh[d] = q_head[d];
+    __syncthreads();
+
+    // Phase 1: QK with deferred scale, vector loads, 4-wide accumulation
+    float lmax = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* blk = k_cache + (size_t)t * bpp + kv_h * bph;
+        float sc = *(const float*)(blk);
+        const signed char* kd = (const signed char*)(blk + 8);
+
+        // 4-wide unrolled dot product with deferred scale
+        float acc = 0.0f;
+        for (int j = 0; j < head_dim; j += 4) {
+            acc += q_sh[j]   * (float)kd[j]
+                 + q_sh[j+1] * (float)kd[j+1]
+                 + q_sh[j+2] * (float)kd[j+2]
+                 + q_sh[j+3] * (float)kd[j+3];
+        }
+        scores[t] = sc * acc * scale_attn;
+        lmax = fmaxf(lmax, scores[t]);
+    }
+
+    ws[tid] = lmax;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid + s]); __syncthreads(); }
+    float max_val = ws[0]; __syncthreads();
+
+    float lsum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) { float e = expf(scores[t] - max_val); scores[t] = e; lsum += e; }
+    ws[tid] = lsum; __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] += ws[tid + s]; __syncthreads(); }
+    float sv = ws[0]; __syncthreads();
+    for (int t = tid; t < seq_len; t += nthreads) scores[t] /= sv;
+    __syncthreads();
+
+    // Phase 2: weighted V sum — precompute score*scale per position
+    // This avoids loading scale once per (position × dimension) — loads it once per position
+    float* sv_cache = ws;  // reuse workspace for score*scale products
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* blk = v_cache + (size_t)t * bpp + kv_h * bph;
+        sv_cache[t] = scores[t] * *(const float*)(blk);
+    }
+    __syncthreads();
+
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int t = 0; t < seq_len; t++) {
+            const unsigned char* blk = v_cache + (size_t)t * bpp + kv_h * bph;
+            val += sv_cache[t] * (float)((signed char)blk[8 + d]);
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
+/// HFQ8 KV: FP32 scale+zero per head, contiguous uint8 data. Asymmetric quantization.
+/// Scales: [max_seq × n_kv_heads × 2] f32 (scale, zero pairs).
+/// Data: [max_seq × n_kv_heads × head_dim] uint8.
+pub const KV_CACHE_WRITE_HFQ8_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_hfq8(
+    unsigned char* __restrict__ dst_data,   // [max_seq × kv_dim] uint8
+    float* __restrict__ dst_scales,         // [max_seq × n_kv_heads × 2] f32
+    const float* __restrict__ src,          // [kv_dim] FP32
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;
+    const int pos = pos_buf[0];
+    const int kv_dim = n_kv_heads * head_dim;
+
+    const float* head_src = src + h * head_dim;
+
+    // Warp min/max reduction (head_dim=128, 32 threads, 4 per thread)
+    float local_min = 1e30f, local_max = -1e30f;
+    for (int i = tid; i < head_dim; i += 32) {
+        float v = head_src[i];
+        local_min = fminf(local_min, v);
+        local_max = fmaxf(local_max, v);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_min = fminf(local_min, __shfl_xor(local_min, offset));
+        local_max = fmaxf(local_max, __shfl_xor(local_max, offset));
+    }
+
+    float scale = (local_max - local_min) / 255.0f;
+    float zero = local_min;
+    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+    // Write scale+zero (lane 0)
+    if (tid == 0) {
+        dst_scales[(pos * n_kv_heads + h) * 2] = scale;
+        dst_scales[(pos * n_kv_heads + h) * 2 + 1] = zero;
+    }
+
+    // Quantize and write contiguous uint8
+    unsigned char* out = dst_data + pos * kv_dim + h * head_dim;
+    for (int i = tid; i < head_dim; i += 32) {
+        int q = __float2int_rn((head_src[i] - zero) * inv_scale);
+        q = max(0, min(255, q));
+        out[i] = (unsigned char)q;
+    }
+}
+"#;
+
+/// Attention with HFQ8 KV cache. Flat layout, FP32 scale+zero, contiguous uint8 data.
+pub const ATTENTION_HFQ8_KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_hfq8_kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_data,  // [max_seq × kv_dim] uint8
+    const float* __restrict__ k_scales,        // [max_seq × n_kv_heads × 2] f32
+    const unsigned char* __restrict__ v_data,
+    const float* __restrict__ v_scales,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int kv_dim = n_kv_heads * head_dim;
+
+    const float* q_head = q + h * head_dim;
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+
+    // Phase 1: Q @ K^T with HFQ8 dequant
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float k_scale = k_scales[(t * n_kv_heads + kv_h) * 2];
+        float k_zero  = k_scales[(t * n_kv_heads + kv_h) * 2 + 1];
+        const unsigned char* k_head = k_data + t * kv_dim + kv_h * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += q_head[d] * (k_scale * (float)k_head[d] + k_zero);
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted V sum with HFQ8 dequant
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int t = 0; t < seq_len; t++) {
+            float v_scale = v_scales[(t * n_kv_heads + kv_h) * 2];
+            float v_zero  = v_scales[(t * n_kv_heads + kv_h) * 2 + 1];
+            val += scores[t] * (v_scale * (float)v_data[t * kv_dim + kv_h * head_dim + d] + v_zero);
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
+/// INT8 KV with separate scale array. Contiguous int8 values, one f32 scale per head.
+/// Keys: [max_seq × n_kv_heads × head_dim] int8, Scales: [max_seq × n_kv_heads] f32.
+/// Write: one warp per head, find amax via shuffle, quantize 4 elements per thread.
+pub const KV_CACHE_WRITE_INT8_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_int8(
+    signed char* __restrict__ dst_vals,   // [max_seq × kv_dim] int8
+    float* __restrict__ dst_scales,       // [max_seq × n_kv_heads] f32
+    const float* __restrict__ src,        // [kv_dim] FP32
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;
+    const int pos = pos_buf[0];
+    const int kv_dim = n_kv_heads * head_dim;
+
+    const float* head_src = src + h * head_dim;
+
+    // Find max absolute value via warp shuffle (head_dim=128, 32 threads, 4 per thread)
+    float amax = 0.0f;
+    for (int i = tid; i < head_dim; i += 32) {
+        amax = fmaxf(amax, fabsf(head_src[i]));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, offset));
+
+    float scale = amax / 127.0f;
+    float inv_scale = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+    // Write scale (lane 0)
+    if (tid == 0) {
+        dst_scales[pos * n_kv_heads + h] = scale;
+    }
+
+    // Quantize and write contiguous int8
+    signed char* out = dst_vals + pos * kv_dim + h * head_dim;
+    for (int i = tid; i < head_dim; i += 32) {
+        int q = __float2int_rn(head_src[i] * inv_scale);
+        q = max(-127, min(127, q));
+        out[i] = (signed char)q;
+    }
+}
+"#;
+
+/// Attention with INT8 KV (separate scale array). Clean indexed access, no block math.
+pub const ATTENTION_INT8_KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_int8_kv(
+    const float* __restrict__ q,
+    const signed char* __restrict__ k_vals,   // [max_seq × kv_dim] int8
+    const float* __restrict__ k_scales,       // [max_seq × n_kv_heads] f32
+    const signed char* __restrict__ v_vals,   // [max_seq × kv_dim] int8
+    const float* __restrict__ v_scales,       // [max_seq × n_kv_heads] f32
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int kv_dim = n_kv_heads * head_dim;
+
+    const float* q_head = q + h * head_dim;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+
+    // Phase 1: Q @ K^T
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float k_scale = k_scales[t * n_kv_heads + kv_h];
+        const signed char* k_head = k_vals + t * kv_dim + kv_h * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += q_head[d] * (k_scale * (float)k_head[d]);
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted V sum
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int t = 0; t < seq_len; t++) {
+            float v_scale = v_scales[t * n_kv_heads + kv_h];
+            val += scores[t] * (v_scale * (float)v_vals[t * kv_dim + kv_h * head_dim + d]);
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
+/// Batched causal attention: all query positions attend to their causal context.
+/// Grid: [n_heads, seq_len, 1]. Each block handles one (head, query_position) pair.
+/// Q/K/V are FP32: [seq_len × n_heads × head_dim] or [seq_len × n_kv_heads × head_dim].
+/// Output: [seq_len × n_heads × head_dim].
+/// For prefill: Q/K/V come from batched projections. KV also written to cache.
+pub const ATTENTION_CAUSAL_BATCHED_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_causal_batched(
+    const float* __restrict__ Q,    // [seq_len × n_heads × head_dim]
+    const float* __restrict__ K,    // [seq_len × n_kv_heads × head_dim]
+    const float* __restrict__ V,    // [seq_len × n_kv_heads × head_dim]
+    float* __restrict__ out,        // [seq_len × n_heads × head_dim]
+    int seq_len,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    float scale
+) {
+    const int h = blockIdx.x;       // query head
+    const int qpos = blockIdx.y;    // query position (0..seq_len-1)
+    if (h >= n_heads || qpos >= seq_len) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    extern __shared__ float sdata[];
+    float* scores = sdata;           // [qpos+1]
+    float* ws = sdata + qpos + 1;   // [nthreads] workspace
+
+    const int q_stride = n_heads * head_dim;
+    const int kv_stride = n_kv_heads * head_dim;
+
+    const float* q_head = Q + qpos * q_stride + h * head_dim;
+    int ctx_len = qpos + 1;  // causal: attend to positions 0..qpos
+
+    // Phase 1: QK dot products
+    float lmax = -1e30f;
+    for (int t = tid; t < ctx_len; t += nthreads) {
+        const float* k_head = K + t * kv_stride + kv_h * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            dot += q_head[d] * k_head[d];
+        scores[t] = dot * scale;
+        lmax = fmaxf(lmax, scores[t]);
+    }
+
+    ws[tid] = lmax;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid+s]); __syncthreads(); }
+    float max_val = ws[0]; __syncthreads();
+
+    float lsum = 0.0f;
+    for (int t = tid; t < ctx_len; t += nthreads) { float e = expf(scores[t] - max_val); scores[t] = e; lsum += e; }
+    ws[tid] = lsum; __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] += ws[tid+s]; __syncthreads(); }
+    float sv = ws[0]; __syncthreads();
+    for (int t = tid; t < ctx_len; t += nthreads) scores[t] /= sv;
+    __syncthreads();
+
+    // Phase 2: weighted V sum
+    float* out_head = out + qpos * q_stride + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int t = 0; t < ctx_len; t++) {
+            const float* v_head = V + t * kv_stride + kv_h * head_dim;
+            val += scores[t] * v_head[d];
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
+/// Batched Q8_0 KV cache write: quantize multiple positions at once.
+/// src: [batch_size × kv_dim] FP32. positions: [batch_size] int32.
+/// Grid: [total_blocks × batch_size]. Each block handles one Q8_0 group for one position.
+pub const KV_CACHE_WRITE_Q8_0_BATCHED_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_q8_0_batched(
+    unsigned char* __restrict__ dst,
+    const float* __restrict__ src,        // [batch_size × kv_dim]
+    const int* __restrict__ positions,    // [batch_size]
+    int n_kv_heads,
+    int head_dim,
+    int batch_size
+) {
+    const int gid = blockIdx.x;           // Q8_0 block index within one position
+    const int bid = blockIdx.y;           // batch index
+    if (bid >= batch_size) return;
+    const int tid = threadIdx.x;          // 0..31
+
+    const int blocks_per_head = head_dim / 32;
+    const int total_blocks = n_kv_heads * blocks_per_head;
+    if (gid >= total_blocks) return;
+
+    const int pos = positions[bid];
+    const int head_idx = gid / blocks_per_head;
+    const int block_idx = gid % blocks_per_head;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int elem_offset = bid * kv_dim + head_idx * head_dim + block_idx * 32 + tid;
+
+    float val = src[elem_offset];
+
+    // Warp max absolute value
+    float amax = fabsf(val);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, offset));
+
+    float scale = amax / 127.0f;
+    float inv_scale = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+    int q = __float2int_rn(val * inv_scale);
+    q = max(-127, min(127, q));
+
+    unsigned char* out = dst + (size_t)pos * total_blocks * 34 + gid * 34;
+    if (tid == 0) *((_Float16*)(out)) = (_Float16)scale;
+    out[2 + tid] = (unsigned char)(signed char)q;
+}
+"#;
+
+/// Quantize KV vector to Q8_0 format (same as GGML Q8_0 / existing GEMV kernels).
+/// Block: [f16 scale (2B)][int8 × 32 (32B)] = 34 bytes per 32 elements.
+/// head_dim=128 → 4 blocks × 34 = 136 bytes per head.
+/// Layout: [max_seq × n_kv_heads × blocks_per_head × 34].
+pub const KV_CACHE_WRITE_Q8_0_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_q8_0(
+    unsigned char* __restrict__ dst,     // quantized cache
+    const float* __restrict__ src,       // [kv_dim] FP32 KV vector
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    // Grid: [n_kv_heads × blocks_per_head, 1, 1]. Block: [32, 1, 1].
+    // Each threadblock quantizes one Q8_0 block (32 elements).
+    const int gid = blockIdx.x;
+    const int tid = threadIdx.x;  // 0..31
+    const int pos = pos_buf[0];
+
+    const int blocks_per_head = head_dim / 32;
+    const int total_blocks = n_kv_heads * blocks_per_head;
+    if (gid >= total_blocks) return;
+
+    const int head_idx = gid / blocks_per_head;
+    const int block_idx = gid % blocks_per_head;
+    const int elem_offset = head_idx * head_dim + block_idx * 32 + tid;
+
+    float val = src[elem_offset];
+
+    // Warp reduction for max absolute value
+    float amax = fabsf(val);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, offset));
+
+    float scale = amax / 127.0f;
+    float inv_scale = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+    int q = __float2int_rn(val * inv_scale);
+    q = max(-127, min(127, q));
+
+    // Output: pos * total_blocks * 34 + gid * 34
+    unsigned char* out = dst + (size_t)pos * total_blocks * 34 + gid * 34;
+
+    // Thread 0 writes the f16 scale
+    if (tid == 0) {
+        *((_Float16*)(out)) = (_Float16)scale;
+    }
+    // All threads write their int8 value
+    out[2 + tid] = (unsigned char)(signed char)q;
+}
+"#;
+
+/// Attention with Q8_0 quantized KV cache — same format as GGML Q8_0.
+/// K and V caches stored as [max_seq × n_kv_heads × blocks_per_head × 34].
+pub const ATTENTION_Q8_0_KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_q8_0_kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const float* q_head = q + h * head_dim;
+    const int blocks_per_head = head_dim / 32;
+    const int total_blocks_per_pos = n_kv_heads * blocks_per_head;
+    const int kv_head_block_start = kv_h * blocks_per_head;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+
+    // Preload Q head into shared memory (loaded once, used for all positions)
+    float* q_shared = workspace + nthreads;  // after workspace
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_shared[d] = q_head[d];
+    __syncthreads();
+
+    // Phase 1: Q @ K^T with Q8_0 dequant (Q preloaded in shared memory)
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float dot = 0.0f;
+        for (int bi = 0; bi < blocks_per_head; bi++) {
+            const unsigned char* block = k_cache + (size_t)t * total_blocks_per_pos * 34
+                                        + (kv_head_block_start + bi) * 34;
+            float d = (float)*((const _Float16*)block);
+            const float* qb = q_shared + bi * 32;
+            for (int j = 0; j < 32; j++) {
+                dot += qb[j] * (d * (float)((signed char)block[2 + j]));
+            }
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted sum of V with Q8_0 dequant
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        int bi = d / 32;
+        int bj = d % 32;
+        for (int t = 0; t < seq_len; t++) {
+            const unsigned char* block = v_cache + (size_t)t * total_blocks_per_pos * 34
+                                        + (kv_head_block_start + bi) * 34;
+            float vd = (float)*((const _Float16*)block) * (float)(signed char)block[2 + bj];
+            val += scores[t] * vd;
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
+/// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
+/// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.
+/// For head_dim=128: 132 bytes vs 512 bytes FP32 = 3.88x compression.
+pub const KV_CACHE_WRITE_Q8_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_q8(
+    unsigned char* __restrict__ dst,
+    const float* __restrict__ src,
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;
+    const int pos = pos_buf[0];
+
+    const float* head_src = src + h * head_dim;
+
+    // Find max absolute value for symmetric quantization
+    extern __shared__ float smem[];
+    float local_max = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(head_src[i]));
+    }
+    smem[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+        __syncthreads();
+    }
+    float amax = smem[0];
+    float scale = amax / 127.0f;
+    float inv_scale = (scale > 0.0f) ? (127.0f / amax) : 0.0f;
+
+    int bytes_per_head = 4 + head_dim;  // f32 scale + int8 values
+    int bytes_per_pos = n_kv_heads * bytes_per_head;
+    unsigned char* out = dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+
+    if (tid == 0) *(float*)(out) = scale;
+    __syncthreads();
+
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float v = head_src[i];
+        int q = __float2int_rn(v * inv_scale);
+        q = max(-127, min(127, q));
+        out[4 + i] = (unsigned char)(signed char)q;
+    }
+}
+"#;
+
+/// Attention with Q8 quantized KV cache — symmetric int8, dequant on read.
+pub const ATTENTION_Q8KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_q8kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache_q8,
+    const unsigned char* __restrict__ v_cache_q8,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const float* q_head = q + h * head_dim;
+    int bytes_per_head = 4 + head_dim;
+    int bytes_per_pos = n_kv_heads * bytes_per_head;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+
+    // Phase 1: Q @ K^T with int8 dequant
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* k_packed = k_cache_q8 + (size_t)t * bytes_per_pos + kv_h * bytes_per_head;
+        float k_scale = *(const float*)(k_packed);
+        const signed char* k_vals = (const signed char*)(k_packed + 4);
+
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += q_head[d] * (k_scale * (float)k_vals[d]);
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted sum of V with int8 dequant
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int t = 0; t < seq_len; t++) {
+            const unsigned char* v_packed = v_cache_q8 + (size_t)t * bytes_per_pos + kv_h * bytes_per_head;
+            float v_scale = *(const float*)(v_packed);
+            signed char v_q = (signed char)v_packed[4 + d];
+            val += scores[t] * (v_scale * (float)v_q);
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
+/// HFQ4 KV block: co-located FP32 scale+zero + packed nibbles. 72 bytes per head.
+/// Layout per position: [n_kv_heads × 72] bytes. One cache line per head.
+pub const KV_CACHE_WRITE_HFQ4_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_hfq4(
+    unsigned char* __restrict__ dst,
+    const float* __restrict__ src,
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;  // 0..31
+    const int pos = pos_buf[0];
+
+    const float* head_src = src + h * head_dim;
+
+    // Each thread handles 4 elements (32 threads × 4 = 128)
+    float v0 = (tid * 4 < head_dim) ? head_src[tid * 4] : 0.0f;
+    float v1 = (tid * 4 + 1 < head_dim) ? head_src[tid * 4 + 1] : 0.0f;
+    float v2 = (tid * 4 + 2 < head_dim) ? head_src[tid * 4 + 2] : 0.0f;
+    float v3 = (tid * 4 + 3 < head_dim) ? head_src[tid * 4 + 3] : 0.0f;
+
+    // Warp min/max
+    float local_min = fminf(fminf(v0, v1), fminf(v2, v3));
+    float local_max = fmaxf(fmaxf(v0, v1), fmaxf(v2, v3));
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_min = fminf(local_min, __shfl_xor(local_min, offset));
+        local_max = fmaxf(local_max, __shfl_xor(local_max, offset));
+    }
+
+    float scale = (local_max - local_min) / 15.0f;
+    float zero = local_min;
+    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+    // Block: [4B scale][4B zero][head_dim/2 nibbles]
+    int bytes_per_block = 8 + head_dim / 2;
+    int bytes_per_pos = n_kv_heads * bytes_per_block;
+    unsigned char* out = dst + (size_t)pos * bytes_per_pos + h * bytes_per_block;
+
+    if (tid == 0) {
+        *(float*)(out) = scale;
+        *(float*)(out + 4) = zero;
+    }
+
+    // Quantize 4 values → 2 bytes (4 nibbles)
+    int q0 = __float2int_rn((v0 - zero) * inv_scale); q0 = max(0, min(15, q0));
+    int q1 = __float2int_rn((v1 - zero) * inv_scale); q1 = max(0, min(15, q1));
+    int q2 = __float2int_rn((v2 - zero) * inv_scale); q2 = max(0, min(15, q2));
+    int q3 = __float2int_rn((v3 - zero) * inv_scale); q3 = max(0, min(15, q3));
+
+    out[8 + tid * 2]     = (unsigned char)((q1 << 4) | q0);
+    out[8 + tid * 2 + 1] = (unsigned char)((q3 << 4) | q2);
+}
+"#;
+
+/// Attention with HFQ4 KV blocks v2. Tight single-block pattern.
+/// 72 bytes per head = one HFQ4-G128 block (scale+zero+64 nibble bytes).
+/// Q preloaded into shared memory. One scale+zero load per position.
+pub const ATTENTION_HFQ4_KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_hfq4_kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int bpb = 8 + head_dim / 2;  // 72 for head_dim=128
+    const int bpp = n_kv_heads * bpb;
+
+    float* scores = sdata;
+    float* ws = sdata + seq_len;
+    float* q_sh = ws + nthreads;  // Q preloaded in shared memory
+
+    // Preload Q head into shared memory
+    const float* q_head = q + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_sh[d] = q_head[d];
+    __syncthreads();
+
+    // Phase 1: Q @ K^T — one 72-byte block per position, tight nibble loop
+    float lmax = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* blk = k_cache + (size_t)t * bpp + kv_h * bpb;
+        float sc = *(const float*)(blk);
+        float zr = *(const float*)(blk + 4);
+        float dot = 0.0f;
+        // 64 bytes of nibbles = 128 elements, 2 per byte
+        for (int j = 0; j < head_dim / 2; j++) {
+            unsigned char pk = blk[8 + j];
+            dot += q_sh[j * 2]     * (sc * (float)(pk & 0xF) + zr)
+                 + q_sh[j * 2 + 1] * (sc * (float)(pk >> 4) + zr);
+        }
+        scores[t] = dot * scale_attn;
+        lmax = fmaxf(lmax, scores[t]);
+    }
+
+    ws[tid] = lmax;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] = fmaxf(ws[tid], ws[tid + s]); __syncthreads(); }
+    float max_val = ws[0]; __syncthreads();
+
+    float lsum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) { float e = expf(scores[t] - max_val); scores[t] = e; lsum += e; }
+    ws[tid] = lsum; __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) { if (tid < s) ws[tid] += ws[tid + s]; __syncthreads(); }
+    float sv = ws[0]; __syncthreads();
+    for (int t = tid; t < seq_len; t += nthreads) scores[t] /= sv;
+    __syncthreads();
+
+    // Phase 2: weighted V sum — same 72-byte block dequant
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        int byte_idx = d / 2;
+        int is_high = d & 1;
+        for (int t = 0; t < seq_len; t++) {
+            const unsigned char* blk = v_cache + (size_t)t * bpp + kv_h * bpb;
+            float sc = *(const float*)(blk);
+            float zr = *(const float*)(blk + 4);
+            unsigned char pk = blk[8 + byte_idx];
+            val += scores[t] * (sc * (float)(is_high ? (pk >> 4) : (pk & 0xF)) + zr);
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
+/// Quantize KV vector to HFQ4-G128 and write to quantized KV cache.
+/// Input: kv_dim floats at kv_src. Output: packed HFQ4 at dst[pos * bytes_per_pos].
+/// Each group of 128 floats → 72 bytes (4B scale + 4B zero + 64B nibbles).
+/// For head_dim=128, one head = exactly one group = 72 bytes.
+pub const KV_CACHE_WRITE_Q4_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_q4(
+    unsigned char* __restrict__ dst,     // quantized cache
+    const float* __restrict__ src,       // [kv_dim] FP32 KV vector
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;  // one block per KV head
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;
+    const int pos = pos_buf[0];
+
+    const float* head_src = src + h * head_dim;
+
+    // Shared memory for min/max reduction
+    extern __shared__ float smem[];
+    float* s_min = smem;
+    float* s_max = smem + blockDim.x;
+
+    // Find min/max across head_dim elements
+    float local_min = 1e30f, local_max = -1e30f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float v = head_src[i];
+        local_min = fminf(local_min, v);
+        local_max = fmaxf(local_max, v);
+    }
+    s_min[tid] = local_min;
+    s_max[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_min[tid] = fminf(s_min[tid], s_min[tid + s]);
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + s]);
+        }
+        __syncthreads();
+    }
+    float vmin = s_min[0];
+    float vmax = s_max[0];
+
+    float scale = (vmax - vmin) / 15.0f;
+    float zero = vmin;
+    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+    // Output layout per head: [4B scale][4B zero][head_dim/2 nibbles]
+    int bytes_per_head = 8 + head_dim / 2;
+    int bytes_per_pos = n_kv_heads * bytes_per_head;
+    unsigned char* out = dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+
+    // Write scale and zero (thread 0 only)
+    if (tid == 0) {
+        *(float*)(out) = scale;
+        *(float*)(out + 4) = zero;
+    }
+    __syncthreads();
+
+    // Quantize and pack nibbles (2 elements per byte)
+    for (int i = tid; i < head_dim / 2; i += blockDim.x) {
+        int e0 = i * 2;
+        int e1 = i * 2 + 1;
+        float v0 = head_src[e0];
+        float v1 = head_src[e1];
+        int q0 = __float2int_rn((v0 - zero) * inv_scale);
+        int q1 = __float2int_rn((v1 - zero) * inv_scale);
+        q0 = max(0, min(15, q0));
+        q1 = max(0, min(15, q1));
+        out[8 + i] = (unsigned char)((q1 << 4) | q0);
+    }
+}
+"#;
+
+/// Attention with quantized HFQ4 KV cache.
+/// Same structure as attention_f32 but dequantizes K and V on the fly.
+pub const ATTENTION_Q4KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_q4kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache_q4,
+    const unsigned char* __restrict__ v_cache_q4,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const float* q_head = q + h * head_dim;
+    int bytes_per_head = 8 + head_dim / 2;
+    int bytes_per_pos = n_kv_heads * bytes_per_head;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+
+    // Phase 1: Q @ K^T with on-the-fly dequant
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* k_packed = k_cache_q4 + (size_t)t * bytes_per_pos + kv_h * bytes_per_head;
+        float k_scale = *(const float*)(k_packed);
+        float k_zero  = *(const float*)(k_packed + 4);
+        const unsigned char* k_nib = k_packed + 8;
+
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d += 2) {
+            unsigned char byte_val = k_nib[d / 2];
+            float k0 = k_scale * (float)(byte_val & 0xF) + k_zero;
+            float k1 = k_scale * (float)(byte_val >> 4) + k_zero;
+            dot += q_head[d] * k0 + q_head[d + 1] * k1;
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted sum of V with on-the-fly dequant
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        int d_byte = d / 2;
+        int d_nib_shift = (d & 1) * 4;
+        for (int t = 0; t < seq_len; t++) {
+            const unsigned char* v_packed = v_cache_q4 + (size_t)t * bytes_per_pos + kv_h * bytes_per_head;
+            float v_scale = *(const float*)(v_packed);
+            float v_zero  = *(const float*)(v_packed + 4);
+            unsigned char byte_val = v_packed[8 + d_byte];
+            float v_val = v_scale * (float)((byte_val >> d_nib_shift) & 0xF) + v_zero;
+            val += scores[t] * v_val;
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
+/// GPU-side KV cache write using pos from a GPU buffer.
+/// Copies kv_dim floats from src to dst at offset pos_buf[0] * kv_dim.
+pub const KV_CACHE_WRITE_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write(
+    float* __restrict__ dst,          // cache: [max_seq * kv_dim]
+    const float* __restrict__ src,    // current KV: [kv_dim]
+    const int* __restrict__ pos_buf,  // position buffer
+    int kv_dim
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_dim) return;
+    int pos = pos_buf[0];
+    dst[pos * kv_dim + i] = src[i];
+}
+"#;
+
 /// GPU-side top-K + top-P sampling. Eliminates 600KB logits download per token.
 /// Single block, 256 threads. Returns token ID + RNG state (8 bytes vs 600KB).
 ///
@@ -824,12 +3063,15 @@ pub const SAMPLE_TOP_P_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 
 extern "C" __global__ void sample_top_p(
-    const float* __restrict__ logits,   // [vocab_size]
+    float* __restrict__ logits,          // [vocab_size] (modified in-place for repeat penalty)
     unsigned int* __restrict__ result,   // [2]: token_id, rng_state
+    const unsigned int* __restrict__ repeat_tokens, // [repeat_window] recent token IDs
     int vocab_size,
     float temperature,
     float top_p,
-    unsigned int rand_seed
+    unsigned int rand_seed,
+    int repeat_window,
+    float repeat_penalty
 ) {
     extern __shared__ char smem[];
     const int tid = threadIdx.x;
@@ -845,6 +3087,16 @@ extern "C" __global__ void sample_top_p(
     float* cand_scores = reduce + nthreads;
     int* cand_indices = (int*)(cand_scores + MAX_CAND);
     int* cand_count = cand_indices + MAX_CAND;
+
+    // Phase 0: Apply repetition penalty — only touches repeat_window positions
+    for (int j = tid; j < repeat_window; j += nthreads) {
+        int tok_id = repeat_tokens[j];
+        if (tok_id < vocab_size) {
+            float v = logits[tok_id];
+            logits[tok_id] = (v > 0.0f) ? (v / repeat_penalty) : (v * repeat_penalty);
+        }
+    }
+    __syncthreads();
 
     // Phase 1: Find max logit
     float local_max = -1e30f;
@@ -1149,6 +3401,63 @@ extern "C" __global__ void embedding_q4k(
         unsigned char qbyte = block[16 + group * 32 + l];
         float nibble = (sub == 0) ? (float)(qbyte & 0xF) : (float)(qbyte >> 4);
         output[elem] = scale * nibble - mn;
+    }
+}
+"#;
+
+/// HFQ4-G256 embedding lookup: dequantize one row from HFQ4-G256 table to F32.
+/// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 elements.
+pub const EMBEDDING_HFQ4G256_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void embedding_hfq4g256(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ output,
+    int token_id, int dim
+) {
+    const int tid = threadIdx.x;
+    const int groups_per_row = dim / 256;
+    const int bytes_per_row = groups_per_row * 136;
+    const unsigned char* row = table + (size_t)token_id * bytes_per_row;
+
+    for (int elem = tid; elem < dim; elem += blockDim.x) {
+        int group = elem / 256;
+        int within = elem % 256;
+        const unsigned char* gptr = row + group * 136;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        int byte_idx = within / 2;
+        unsigned char byte_val = gptr[8 + byte_idx];
+        int nibble = (within % 2 == 0) ? (byte_val & 0xF) : (byte_val >> 4);
+        output[elem] = scale * (float)nibble + zero;
+    }
+}
+"#;
+
+/// HFQ4-G128 embedding lookup: dequantize one row from HFQ4-G128 table to F32.
+pub const EMBEDDING_HFQ4G128_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void embedding_hfq4g128(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ output,
+    int token_id, int dim
+) {
+    const int tid = threadIdx.x;
+    const int groups_per_row = dim / 128;
+    const int bytes_per_row = groups_per_row * 72;
+    const unsigned char* row = table + (size_t)token_id * bytes_per_row;
+
+    for (int elem = tid; elem < dim; elem += blockDim.x) {
+        int group = elem / 128;
+        int within = elem % 128;
+        const unsigned char* gptr = row + group * 72;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+        int byte_idx = within / 2;
+        unsigned char byte_val = gptr[8 + byte_idx];
+        int nibble = (within % 2 == 0) ? (byte_val & 0xF) : (byte_val >> 4);
+        output[elem] = scale * (float)nibble + zero;
     }
 }
 "#;

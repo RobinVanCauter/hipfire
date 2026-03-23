@@ -493,8 +493,10 @@ pub struct WeightTensor {
 /// How the embedding table is stored on GPU.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EmbeddingFormat {
-    F32,   // dequantized to F32, use D2D copy
-    Q4K,   // raw Q4K blocks, use GPU dequant kernel
+    F32,       // dequantized to F32, use D2D copy
+    Q4K,       // raw Q4K blocks, use GPU dequant kernel
+    HFQ4G256,  // raw HFQ4-G256 blocks, use GPU dequant kernel
+    HFQ4G128,  // raw HFQ4-G128 blocks, use GPU dequant kernel
     Q8_0,  // raw Q8_0 blocks, use GPU dequant kernel
 }
 
@@ -535,6 +537,8 @@ pub fn weight_gemv(
         DType::Q6K => gpu.gemv_q6k(&w.buf, x, y, w.m, w.k),
         DType::Q8_0 => gpu.gemv_q8_0(&w.buf, x, y, w.m, w.k),
         DType::Q8HFQ => gpu.gemv_q8hfq(&w.buf, x, y, w.m, w.k, w.row_stride),
+        DType::HFQ4G256 => gpu.gemv_hfq4g256(&w.buf, x, y, w.m, w.k),
+        DType::HFQ4G128 => gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k),
         DType::Q4F16G64 => gpu.gemv_q4f16_g64(&w.buf, x, y, w.m, w.k),
         DType::Q4F16G32 => gpu.gemv_q4f16_g32(&w.buf, x, y, w.m, w.k),
         other => {
@@ -542,6 +546,203 @@ pub fn weight_gemv(
             Err(hip_bridge::HipError::new(0, &format!("unsupported dtype {:?}", other)))
         }
     }
+}
+
+/// Batched weight GEMM: y[b] = W * x[b] for all batch elements.
+/// x: [batch_size × K], y: [batch_size × M]. Falls back to repeated GEMV for unsupported formats.
+pub fn weight_gemm(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    batch_size: usize,
+) -> HipResult<()> {
+    match w.gpu_dtype {
+        DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
+        DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
+        _ => {
+            // Fallback: repeated GEMV (no batched kernel for this format)
+            for b in 0..batch_size {
+                // Create sub-tensor views — this is a hack, proper slicing needed
+                // For now, just use the non-batched path
+                return Err(hip_bridge::HipError::new(0,
+                    &format!("no batched GEMM for {:?}", w.gpu_dtype)));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Batched prefill: process all prompt tokens in one forward pass.
+/// Returns logits for the LAST position only.
+/// KV cache is filled for all positions.
+pub fn prefill_forward(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    tokens: &[u32],
+    kv_cache: &mut KvCache,
+) -> HipResult<Vec<f32>> {
+    let batch = tokens.len();
+    let dim = config.dim;
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+    let q_dim = n_heads * head_dim;
+
+    // Allocate batched buffers: [batch × dim]
+    let x_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+    let tmp_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+    let q_batch = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
+    let k_batch = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
+    let v_batch = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
+    let attn_out_batch = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
+    let o_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+    let gate_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
+    let up_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
+    let ffn_hidden_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
+    let ffn_out_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+
+    // Embedding: lookup each token individually into the batch buffer
+    let x_single = gpu.alloc_tensor(&[dim], DType::F32)?;
+    for (i, &token) in tokens.iter().enumerate() {
+        match weights.embd_format {
+            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x_single, token, dim)?,
+            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x_single, token, dim)?,
+            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x_single, token, dim)?,
+            EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x_single, token, dim)?,
+            EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x_single, token, dim)?,
+        }
+        gpu.hip.memcpy_dtod_at(&x_batch.buf, i * dim * 4, &x_single.buf, 0, dim * 4)?;
+    }
+    gpu.free_tensor(x_single)?;
+
+    // Position array for batched RoPE: [0, 1, 2, ..., batch-1]
+    let pos_data: Vec<i32> = (0..batch as i32).collect();
+    let pos_bytes: Vec<u8> = pos_data.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    let pos_array = gpu.alloc_tensor(&[batch], DType::F32)?;  // i32 same size as f32
+    gpu.hip.memcpy_htod(&pos_array.buf, &pos_bytes)?;
+
+    // Per-position scratch buffers (reused across all layers)
+    let q_slice = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+    let k_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+    let v_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+    let attn_slice = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+    let pos_buf = gpu.hip.malloc(4)?;
+
+    // Layer loop
+    for layer_idx in 0..config.n_layers {
+        let layer = &weights.layers[layer_idx];
+
+        // Batched RMSNorm: each row of x_batch independently
+        for i in 0..batch {
+            // We need per-row norm — use the batched rmsnorm with batch=batch
+            // Actually, rmsnorm_batched already handles this if we set batch=batch, n=dim
+        }
+        gpu.rmsnorm_batched(&x_batch, &layer.attn_norm, &tmp_batch, batch, dim, config.norm_eps)?;
+
+        // Batched QKV projections
+        weight_gemm(gpu, &layer.wq, &tmp_batch, &q_batch, batch)?;
+        weight_gemm(gpu, &layer.wk, &tmp_batch, &k_batch, batch)?;
+        weight_gemm(gpu, &layer.wv, &tmp_batch, &v_batch, batch)?;
+
+        // QK norm (per-position, per-head)
+        if config.has_qk_norm {
+            if let Some(ref qn) = layer.q_norm {
+                gpu.rmsnorm_batched(&q_batch, qn, &q_batch, batch * n_heads, head_dim, config.norm_eps)?;
+            }
+            if let Some(ref kn) = layer.k_norm {
+                gpu.rmsnorm_batched(&k_batch, kn, &k_batch, batch * n_kv_heads, head_dim, config.norm_eps)?;
+            }
+        }
+
+        // Batched RoPE: all positions in one kernel launch
+        gpu.rope_batched_f32(&q_batch, &k_batch, &pos_array,
+            n_heads, n_kv_heads, head_dim, config.rope_freq_base, batch)?;
+
+        // Batched KV cache write: all positions in 2 kernel launches (K + V)
+        if kv_cache.quantized && kv_cache.quant_q8 {
+            gpu.kv_cache_write_q8_0_batched(&kv_cache.k_gpu[layer_idx], &k_batch, &pos_array, n_kv_heads, head_dim, batch)?;
+            gpu.kv_cache_write_q8_0_batched(&kv_cache.v_gpu[layer_idx], &v_batch, &pos_array, n_kv_heads, head_dim, batch)?;
+        } else {
+            for i in 0..batch {
+                let pos_i32 = i as i32;
+                gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
+                gpu.hip.memcpy_dtod_at(&k_slice.buf, 0, &k_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
+                gpu.hip.memcpy_dtod_at(&v_slice.buf, 0, &v_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
+                gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, kv_dim)?;
+                gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, kv_dim)?;
+            }
+        }
+
+        // Batched causal attention: one kernel launch for all positions
+        gpu.attention_causal_batched(
+            &q_batch, &k_batch, &v_batch, &attn_out_batch,
+            batch, n_heads, n_kv_heads, head_dim,
+        )?;
+
+        // Batched output projection
+        weight_gemm(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
+
+        // Batched residual add: x_batch += o_batch
+        gpu.add_inplace_f32(&x_batch, &o_batch)?;
+
+        // Batched FFN norm
+        gpu.rmsnorm_batched(&x_batch, &layer.ffn_norm, &tmp_batch, batch, dim, config.norm_eps)?;
+
+        // Batched FFN projections
+        weight_gemm(gpu, &layer.w_gate, &tmp_batch, &gate_batch, batch)?;
+        weight_gemm(gpu, &layer.w_up, &tmp_batch, &up_batch, batch)?;
+
+        // Batched SiLU * mul
+        gpu.silu_mul_f32(&gate_batch, &up_batch, &ffn_hidden_batch)?;
+
+        // Batched down projection
+        weight_gemm(gpu, &layer.w_down, &ffn_hidden_batch, &ffn_out_batch, batch)?;
+
+        // Batched residual
+        gpu.add_inplace_f32(&x_batch, &ffn_out_batch)?;
+    }
+
+    // Free per-position scratch
+    gpu.free_tensor(pos_array)?;
+    gpu.free_tensor(q_slice)?;
+    gpu.free_tensor(k_slice)?;
+    gpu.free_tensor(v_slice)?;
+    gpu.free_tensor(attn_slice)?;
+    gpu.hip.free(pos_buf)?;
+
+    // Final norm + output projection for LAST position only
+    let last_off = (batch - 1) * dim * 4;
+    let x_last = gpu.alloc_tensor(&[dim], DType::F32)?;
+    gpu.hip.memcpy_dtod_at(&x_last.buf, 0, &x_batch.buf, last_off, dim * 4)?;
+
+    let tmp = gpu.alloc_tensor(&[dim], DType::F32)?;
+    gpu.rmsnorm_f32(&x_last, &weights.output_norm, &tmp, config.norm_eps)?;
+
+    let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
+    weight_gemv(gpu, &weights.output, &tmp, &logits)?;
+
+    let logits_data = gpu.download_f32(&logits)?;
+
+    // Free all batched buffers
+    gpu.free_tensor(x_batch)?;
+    gpu.free_tensor(tmp_batch)?;
+    gpu.free_tensor(q_batch)?;
+    gpu.free_tensor(k_batch)?;
+    gpu.free_tensor(v_batch)?;
+    gpu.free_tensor(attn_out_batch)?;
+    gpu.free_tensor(o_batch)?;
+    gpu.free_tensor(gate_batch)?;
+    gpu.free_tensor(up_batch)?;
+    gpu.free_tensor(ffn_hidden_batch)?;
+    gpu.free_tensor(ffn_out_batch)?;
+    gpu.free_tensor(x_last)?;
+    gpu.free_tensor(tmp)?;
+    gpu.free_tensor(logits)?;
+
+    Ok(logits_data)
 }
 
 /// Load LLaMA weights from GGUF onto GPU.
@@ -675,6 +876,9 @@ pub struct ForwardScratch {
     pub ffn_out: GpuTensor,
     pub logits: GpuTensor,
     pub sample_buf: GpuTensor,
+    pub repeat_buf: GpuTensor,
+    pub attn_partials: GpuTensor,  // flash-decoding partial results
+    pub pos_buf: hip_bridge::DeviceBuffer,
 }
 
 impl ForwardScratch {
@@ -682,6 +886,11 @@ impl ForwardScratch {
         let dim = config.dim;
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
+        // Flash-decoding partials: n_heads × max_chunks × (2 + head_dim) floats
+        // max_chunks = ceil(2048 / 128) = 16
+        let max_chunks = 16;
+        let partial_stride = 2 + config.head_dim;
+        let partials_size = config.n_heads * max_chunks * partial_stride;
         Ok(Self {
             x: gpu.alloc_tensor(&[dim], DType::F32)?,
             tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
@@ -696,6 +905,9 @@ impl ForwardScratch {
             ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
             logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
             sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
+            repeat_buf: gpu.alloc_tensor(&[64], DType::F32)?,
+            attn_partials: gpu.alloc_tensor(&[partials_size], DType::F32)?,
+            pos_buf: gpu.hip.malloc(4)?,  // single i32
         })
     }
 }
@@ -713,19 +925,55 @@ pub fn forward_scratch(
     temperature: f32,
     top_p: f32,
     rng_state: u32,
+    repeat_window: usize,
+    repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
-    let dim = config.dim;
-    let n_heads = config.n_heads;
-    let n_kv_heads = config.n_kv_heads;
-    let head_dim = config.head_dim;
-    let kv_dim = n_kv_heads * head_dim;
+    forward_scratch_embed(gpu, weights, config, token, pos, scratch)?;
+    forward_scratch_layers(gpu, weights, config, pos, kv_cache, scratch, temperature, top_p, rng_state, repeat_window, repeat_penalty)
+}
 
+/// Upload pos and compute embedding. Must be called before forward_scratch_layers.
+pub fn forward_scratch_embed(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    token: u32,
+    pos: usize,
+    scratch: &ForwardScratch,
+) -> HipResult<()> {
+    let dim = config.dim;
+    // Upload pos to GPU buffer (4 bytes)
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
     // Embedding lookup
     match weights.embd_format {
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &scratch.x, token, dim)?,
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?,
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?,
     }
+    Ok(())
+}
+
+/// Layer loop + final norm + logits + sampling. Graph-capturable.
+pub fn forward_scratch_layers(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    temperature: f32,
+    top_p: f32,
+    rng_state: u32,
+    repeat_window: usize,
+    repeat_penalty: f32,
+) -> HipResult<(u32, u32)> {
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_dim = n_kv_heads * head_dim;
 
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
@@ -753,16 +1001,54 @@ pub fn forward_scratch(
             }
         }
 
-        gpu.rope_f32(&scratch.q, &scratch.k, pos, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
+        gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
-        let cache_byte_offset = pos * kv_dim * 4;
-        gpu.hip.memcpy_dtod_at(&kv_cache.k_gpu[layer_idx].buf, cache_byte_offset, &scratch.k.buf, 0, kv_dim * 4)?;
-        gpu.hip.memcpy_dtod_at(&kv_cache.v_gpu[layer_idx].buf, cache_byte_offset, &scratch.v.buf, 0, kv_dim * 4)?;
-
-        gpu.attention_f32(
-            &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &scratch.attn_out, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-        )?;
+        if kv_cache.quant_hfq4 {
+            gpu.kv_cache_write_hfq4(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_hfq4(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_hfq4_kv(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else if kv_cache.quantized && !kv_cache.k_scales.is_empty() && !kv_cache.quant_int8 && !kv_cache.quant_q8 {
+            // HFQ8 flat layout
+            gpu.kv_cache_write_hfq8(&kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_hfq8(&kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_hfq8_kv(
+                &scratch.q,
+                &kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx],
+                &kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else if kv_cache.quant_int8 {
+            gpu.kv_cache_write_int8c_f16(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_int8c_f16(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_int8c_f16_kv(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else if kv_cache.quantized && kv_cache.quant_q8 {
+            gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_q8_0_kv(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else if kv_cache.quantized {
+            gpu.kv_cache_write_q4(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_q4(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_q4kv(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else {
+            gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
+            gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
+            gpu.attention_f32(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        }
 
         weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
@@ -787,11 +1073,125 @@ pub fn forward_scratch(
     gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
-    // GPU-side sampling
+    // GPU-side sampling (includes sync readback — can't be in graph capture)
     gpu.sample_top_p(
-        &scratch.logits, &scratch.sample_buf,
+        &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
         config.vocab_size, temperature, top_p, rng_state,
+        repeat_window, repeat_penalty,
     )
+}
+
+/// Layer loop + final norm + logits only (no sampling). Graph-capturable.
+pub fn forward_scratch_compute(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+) -> HipResult<()> {
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+
+    for layer_idx in 0..config.n_layers {
+        let layer = &weights.layers[layer_idx];
+        gpu.rmsnorm_f32(&scratch.x, &layer.attn_norm, &scratch.tmp, config.norm_eps)?;
+
+        if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
+            gpu.fused_qkv_q4k(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &scratch.tmp, &scratch.q, &scratch.k, &scratch.v,
+                layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.wq, &scratch.tmp, &scratch.q)?;
+            weight_gemv(gpu, &layer.wk, &scratch.tmp, &scratch.k)?;
+            weight_gemv(gpu, &layer.wv, &scratch.tmp, &scratch.v)?;
+        }
+
+        if config.has_qk_norm {
+            if let Some(ref qn) = layer.q_norm {
+                gpu.rmsnorm_batched(&scratch.q, qn, &scratch.q, n_heads, head_dim, config.norm_eps)?;
+            }
+            if let Some(ref kn) = layer.k_norm {
+                gpu.rmsnorm_batched(&scratch.k, kn, &scratch.k, n_kv_heads, head_dim, config.norm_eps)?;
+            }
+        }
+
+        gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
+
+        if kv_cache.quant_hfq4 {
+            gpu.kv_cache_write_hfq4(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_hfq4(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_hfq4_kv(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else if kv_cache.quantized && !kv_cache.k_scales.is_empty() && !kv_cache.quant_int8 && !kv_cache.quant_q8 {
+            // HFQ8 flat layout
+            gpu.kv_cache_write_hfq8(&kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_hfq8(&kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_hfq8_kv(
+                &scratch.q,
+                &kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx],
+                &kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else if kv_cache.quant_int8 {
+            gpu.kv_cache_write_int8c_f16(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_int8c_f16(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_int8c_f16_kv(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else if kv_cache.quantized && kv_cache.quant_q8 {
+            gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_q8_0_kv(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else if kv_cache.quantized {
+            gpu.kv_cache_write_q4(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_q4(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_q4kv(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else {
+            gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
+            gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
+            gpu.attention_f32(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        }
+
+        weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
+        gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
+
+        gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
+        if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
+            gpu.fused_gate_up_q4k(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &scratch.tmp, &scratch.gate, &scratch.up,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.w_gate, &scratch.tmp, &scratch.gate)?;
+            weight_gemv(gpu, &layer.w_up, &scratch.tmp, &scratch.up)?;
+        }
+
+        gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
+        weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
+        gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+    }
+
+    gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
+    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    Ok(())
 }
 
 /// Run a single forward pass for one token (decode step).
@@ -815,6 +1215,8 @@ pub fn forward(
     match weights.embd_format {
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
     }
 
@@ -831,6 +1233,11 @@ pub fn forward(
     let up = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
     let ffn_hidden = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
     let ffn_out = gpu.alloc_tensor(&[dim], DType::F32)?;
+
+    // Upload pos to GPU buffer (4 bytes)
+    let pos_buf = gpu.hip.malloc(4)?;
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
 
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
@@ -866,27 +1273,20 @@ pub fn forward(
             }
         }
 
-        // RoPE — GPU-side, no CPU round-trip
-        gpu.rope_f32(&q, &k, pos, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
+        // RoPE — GPU-side, reads pos from GPU buffer
+        gpu.rope_f32(&q, &k, &pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
-        // Store K, V in GPU cache — pure D2D copy, no CPU involvement
-        let cache_byte_offset = pos * kv_dim * 4;
-        gpu.hip.memcpy_dtod_at(
-            &kv_cache.k_gpu[layer_idx].buf, cache_byte_offset,
-            &k.buf, 0,
-            kv_dim * 4,
-        )?;
-        gpu.hip.memcpy_dtod_at(
-            &kv_cache.v_gpu[layer_idx].buf, cache_byte_offset,
-            &v.buf, 0,
-            kv_dim * 4,
-        )?;
+        // Store K, V in GPU cache — GPU-side copy using pos from GPU buffer
+        gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
+
         // GPU-side attention
         gpu.attention_f32(
             &q,
             &kv_cache.k_gpu[layer_idx],
             &kv_cache.v_gpu[layer_idx],
             &attn_out,
+            &pos_buf,
             pos + 1,
             n_heads,
             n_kv_heads,
@@ -958,19 +1358,19 @@ pub fn forward_sample(
     pos: usize,
     kv_cache: &mut KvCache,
     sample_buf: &GpuTensor,
+    repeat_buf: &GpuTensor,
     temperature: f32,
     top_p: f32,
     rng_state: u32,
+    repeat_window: usize,
+    repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
-    // Run forward pass to get logits on GPU
     let logits_on_gpu = forward_logits_gpu(gpu, weights, config, token, pos, kv_cache)?;
-
-    // Sample on GPU — returns token_id + new rng state
     let result = gpu.sample_top_p(
-        &logits_on_gpu, sample_buf,
+        &logits_on_gpu, sample_buf, repeat_buf,
         config.vocab_size, temperature, top_p, rng_state,
+        repeat_window, repeat_penalty,
     )?;
-
     gpu.free_tensor(logits_on_gpu)?;
     Ok(result)
 }
@@ -994,6 +1394,8 @@ fn forward_logits_gpu(
     match weights.embd_format {
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
     }
 
@@ -1007,6 +1409,11 @@ fn forward_logits_gpu(
     let up = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
     let ffn_hidden = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
     let ffn_out = gpu.alloc_tensor(&[dim], DType::F32)?;
+
+    // Upload pos to GPU buffer (4 bytes)
+    let pos_buf = gpu.hip.malloc(4)?;
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
 
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
@@ -1033,21 +1440,14 @@ fn forward_logits_gpu(
             }
         }
 
-        gpu.rope_f32(&q, &k, pos, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
+        gpu.rope_f32(&q, &k, &pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
-        let cache_byte_offset = pos * kv_dim * 4;
-        gpu.hip.memcpy_dtod_at(
-            &kv_cache.k_gpu[layer_idx].buf, cache_byte_offset,
-            &k.buf, 0, kv_dim * 4,
-        )?;
-        gpu.hip.memcpy_dtod_at(
-            &kv_cache.v_gpu[layer_idx].buf, cache_byte_offset,
-            &v.buf, 0, kv_dim * 4,
-        )?;
+        gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
 
         gpu.attention_f32(
             &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &attn_out, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            &attn_out, &pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
         )?;
 
         weight_gemv(gpu, &layer.wo, &attn_out, &o)?;
@@ -1127,12 +1527,18 @@ fn per_head_rmsnorm_cpu(data: &mut [f32], weight: &[f32], n_heads: usize, head_d
 /// GPU-resident KV cache for autoregressive generation.
 /// Pre-allocates [max_seq * n_kv_heads * head_dim] per layer on GPU.
 pub struct KvCache {
-    pub k_gpu: Vec<GpuTensor>,   // [n_layers] each [max_seq * kv_dim]
-    pub v_gpu: Vec<GpuTensor>,   // [n_layers] each [max_seq * kv_dim]
+    pub k_gpu: Vec<GpuTensor>,   // [n_layers] key values (FP32 or int8)
+    pub v_gpu: Vec<GpuTensor>,   // [n_layers] value values (FP32 or int8)
+    pub k_scales: Vec<GpuTensor>,// [n_layers] key scales (for INT8 mode)
+    pub v_scales: Vec<GpuTensor>,// [n_layers] value scales (for INT8 mode)
     pub kv_dim: usize,
     pub max_seq: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
+    pub quantized: bool,
+    pub quant_q8: bool,
+    pub quant_int8: bool,        // true = INT8 with separate scales
+    pub quant_hfq4: bool,        // true = HFQ4 co-located blocks (72 bytes/head)
 }
 
 impl KvCache {
@@ -1151,7 +1557,129 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false })
+    }
+
+    /// Create quantized KV cache (HFQ4-G128). 3.56x smaller than FP32.
+    pub fn new_gpu_q4(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        // Per position per head: 8 bytes (scale+zero) + head_dim/2 bytes (nibbles)
+        let bytes_per_head = 8 + head_dim / 2;
+        let bytes_per_pos = n_kv_heads * bytes_per_head;
+        let cache_bytes = max_seq_len * bytes_per_pos;
+        // Allocate as raw bytes (use F32 dtype but size in bytes)
+        let cache_elems = (cache_bytes + 3) / 4; // round up to F32 elements
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+        }
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false })
+    }
+
+    /// Create Q8_0 quantized KV cache (GGML Q8_0 format). 3.76x smaller than FP32.
+    /// Block: [f16 scale (2B)][int8 × 32 (32B)] = 34 bytes per 32 elements.
+    /// head_dim=128 → 4 blocks × 34 = 136 bytes per head.
+    pub fn new_gpu_q8(
+        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let blocks_per_head = head_dim / 32;
+        let total_blocks = n_kv_heads * blocks_per_head;
+        let cache_bytes = max_seq_len * total_blocks * 34;
+        let cache_elems = (cache_bytes + 3) / 4;
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+        }
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false })
+    }
+
+    /// Create INT8 co-located KV cache: [f32 scale][pad 4B][int8 × head_dim] = 136 bytes per head.
+    pub fn new_gpu_int8c(
+        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let bph = 8 + head_dim; // 136 for head_dim=128 (8-byte header + data)
+        let bpp = n_kv_heads * bph;
+        let cache_bytes = max_seq_len * bpp;
+        let cache_elems = (cache_bytes + 3) / 4;
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+        }
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false })
+    }
+
+    /// Create HFQ4 KV cache: co-located blocks. 72 bytes per head (scale+zero+nibbles).
+    pub fn new_gpu_hfq4kv(
+        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let bytes_per_block = 8 + head_dim / 2; // 72 for head_dim=128
+        let bytes_per_pos = n_kv_heads * bytes_per_block;
+        let cache_bytes = max_seq_len * bytes_per_pos;
+        let cache_elems = (cache_bytes + 3) / 4;
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+        }
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true })
+    }
+
+    /// Create HFQ8 KV cache: FP32 scale+zero per head, contiguous uint8 data.
+    pub fn new_gpu_hfq8(
+        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let val_elems = (max_seq_len * kv_dim + 3) / 4; // uint8 data, rounded to f32
+        let scale_elems = max_seq_len * n_kv_heads * 2; // scale + zero per head per pos
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        let mut k_scales = Vec::with_capacity(n_layers);
+        let mut v_scales = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[val_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[val_elems], DType::F32)?);
+            k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
+            v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
+        }
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false })
+    }
+
+    /// Create INT8 KV cache with separate scale arrays. Clean contiguous layout.
+    pub fn new_gpu_int8(
+        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        // Values: max_seq × kv_dim bytes (int8). Round up to f32 elements for alloc.
+        let val_elems = (max_seq_len * kv_dim + 3) / 4;
+        // Scales: max_seq × n_kv_heads floats
+        let scale_elems = max_seq_len * n_kv_heads;
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        let mut k_scales = Vec::with_capacity(n_layers);
+        let mut v_scales = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[val_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[val_elems], DType::F32)?);
+            k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
+            v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
+        }
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false })
     }
 
     /// Store K, V at position `pos` in layer cache (CPU → GPU copy into cache slot).

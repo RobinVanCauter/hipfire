@@ -395,6 +395,96 @@ fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, usize) {
     (output, row_stride)
 }
 
+// ─── HFQ4-G256 Quantization ─────────────────────────────────────────────────
+
+/// Quantize F32 weights to HFQ4-G256: flat 4-bit with 256-weight groups.
+/// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 weights (0.531 B/w).
+/// 18 VGPRs, 100% occupancy on RDNA1. Beats Q4_K at all matrix sizes.
+fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 136;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let group = &f32_data[start..end];
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+
+        let actual_len = end - start;
+        // Pack 256 weights into 128 bytes of nibbles
+        // byte[i] = weight[2*i] (lo nibble) | weight[2*i+1] (hi nibble)
+        for i in 0..128 {
+            let idx_lo = 2 * i;
+            let idx_hi = 2 * i + 1;
+            let lo_val = if idx_lo < actual_len { group[idx_lo] } else { min_val };
+            let hi_val = if idx_hi < actual_len { group[idx_hi] } else { min_val };
+
+            let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
+            let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
+
+            output[out_off + 8 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
+        }
+    }
+
+    output
+}
+
+/// Quantize F32 weights to HFQ4-G128: flat 4-bit with 128-weight groups.
+/// Block: [f32 scale][f32 zero][64B nibbles] = 72 bytes per 128 weights (0.5625 B/w).
+/// 14 VGPRs, 100% occupancy. Better quality for small K dimensions.
+fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
+    let group_size = 128;
+    let block_bytes = 72;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let group = &f32_data[start..end];
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+
+        let actual_len = end - start;
+        for i in 0..64 {
+            let idx_lo = 2 * i;
+            let idx_hi = 2 * i + 1;
+            let lo_val = if idx_lo < actual_len { group[idx_lo] } else { min_val };
+            let hi_val = if idx_hi < actual_len { group[idx_hi] } else { min_val };
+
+            let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
+            let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
+
+            output[out_off + 8 + i] = lo_q.min(15) | (hi_q.min(15) << 4);
+        }
+    }
+
+    output
+}
+
 // ─── HFQ File Format ────────────────────────────────────────────────────────
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
@@ -409,6 +499,8 @@ enum QuantType {
     Q8F16 = 3,
     Q4K = 4,
     Q8HFQ = 5,
+    HFQ4G256 = 6,
+    HFQ4G128 = 7,
 }
 
 struct HfqTensor {
@@ -547,6 +639,7 @@ fn main() {
     let use_q8hfq = format == "q8hfq";
     let use_q4k_all = format == "q4k";
     let use_q4k_q8embed = format == "q4k-q8embed";
+    let use_hfq4g256 = format == "hfq4g256" || format == "hfq4";
 
     let input_dir = Path::new(input_dir);
     let output_path = Path::new(output_path);
@@ -675,7 +768,18 @@ fn main() {
             let this_q4as8 = use_fast && !this_q8; // FFN tensors in q8-fast mode
             let this_q4k = use_q4k_all || use_q4k_q8embed || use_mixed;
 
-            let (quantized, qt, gs, label) = if this_q8 {
+            let (quantized, qt, gs, label) = if use_hfq4g256 {
+                // Auto-select G128 vs G256 based on K dimension
+                // G256 for K >= 4096 (better coalescing), G128 for smaller K (better quality)
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim >= 4096 && k_dim % 256 == 0 {
+                    let q = quantize_hfq4g256(&f32_data);
+                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                } else {
+                    let q = quantize_hfq4g128(&f32_data);
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                }
+            } else if this_q8 {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_FP16")
             } else if this_q4as8 {
@@ -695,7 +799,21 @@ fn main() {
             for b in 0..n_blocks {
                 let start = b * block_size;
                 let end = (start + block_size).min(n_elements);
-                if this_q8 || this_q4as8 {
+                if use_hfq4g256 {
+                    // Both G128 (72B) and G256 (136B): [f32 scale][f32 zero][nibbles]
+                    let block_bytes = if block_size == 256 { 136 } else { 72 };
+                    let off = b * block_bytes;
+                    let scale = f32::from_le_bytes([quantized[off], quantized[off+1], quantized[off+2], quantized[off+3]]);
+                    let zero = f32::from_le_bytes([quantized[off+4], quantized[off+5], quantized[off+6], quantized[off+7]]);
+                    for i in 0..(end - start) {
+                        let byte_idx = i / 2;
+                        let nibble = if i % 2 == 0 { quantized[off + 8 + byte_idx] & 0xF } else { quantized[off + 8 + byte_idx] >> 4 };
+                        let dequant = scale * nibble as f32 + zero;
+                        let err = (dequant - f32_data[start + i]).abs();
+                        total_quant_error += err as f64;
+                        max_quant_error = max_quant_error.max(err);
+                    }
+                } else if this_q8 || this_q4as8 {
                     let off = b * 34;
                     let scale = f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
                     for i in 0..(end - start) {

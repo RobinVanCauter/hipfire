@@ -34,6 +34,8 @@ pub enum DType {
     Q4F16G64,  // 36 bytes per 64 elements (RDNA-native FP16 dequant)
     Q4F16G32,  // 20 bytes per 32 elements (RDNA-native FP16 dequant)
     Q8HFQ,     // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
+    HFQ4G256,  // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
+    HFQ4G128,  // 72 bytes per 128 elements (flat 4-bit, f32 scale+zero, 14 VGPRs)
     Raw,       // raw bytes, no element interpretation
 }
 
@@ -42,7 +44,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -54,9 +56,16 @@ pub struct Gpu {
     modules: HashMap<String, hip_bridge::Module>,
     functions: HashMap<String, hip_bridge::Function>,
     pool: crate::pool::GpuPool,
+    /// When set, all kernel launches go to this stream instead of null stream.
+    pub active_stream: Option<hip_bridge::Stream>,
 }
 
 impl Gpu {
+    /// Returns the active stream ref for kernel launches (None = null stream).
+    fn stream_ref(&self) -> Option<&hip_bridge::Stream> {
+        self.active_stream.as_ref()
+    }
+
     pub fn init() -> HipResult<Self> {
         let hip = HipRuntime::load()?;
         let count = hip.device_count()?;
@@ -73,6 +82,7 @@ impl Gpu {
             modules: HashMap::new(),
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
+            active_stream: None,
         })
     }
 
@@ -276,6 +286,62 @@ impl Gpu {
         }
     }
 
+    /// HFQ4-G256 embedding lookup: dequantize one row on GPU, output F32.
+    pub fn embedding_lookup_hfq4g256(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_id: u32,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("embedding_hfq4g256", kernels::EMBEDDING_HFQ4G256_SRC, "embedding_hfq4g256")?;
+        let func = &self.functions["embedding_hfq4g256"];
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tid = token_id as i32;
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tid as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
+    /// HFQ4-G128 embedding lookup: dequantize one row on GPU, output F32.
+    pub fn embedding_lookup_hfq4g128(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_id: u32,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("embedding_hfq4g128", kernels::EMBEDDING_HFQ4G128_SRC, "embedding_hfq4g128")?;
+        let func = &self.functions["embedding_hfq4g128"];
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tid = token_id as i32;
+        let mut d = dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tid as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// Upload raw bytes to GPU (for quantized weights).
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
         let buf = self.hip.malloc(data.len())?;
@@ -336,7 +402,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -377,7 +443,241 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 0,
-                None,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// HFQ4-G128 GEMV: flat 4-bit with 128-weight groups.
+    /// K must be multiple of 128.
+    pub fn gemv_hfq4g128(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemv_hfq4g128", kernels::GEMV_HFQ4G128_SRC, "gemv_hfq4g128")?;
+        let func = &self.functions["gemv_hfq4g128"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Batched HFQ4-G128 GEMM. Same tiled approach as G256.
+    pub fn gemm_hfq4g128(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemm_hfq4g128", kernels::GEMM_HFQ4G128_SRC, "gemm_hfq4g128")?;
+        let func = &self.functions["gemm_hfq4g128"];
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let batch_tiles = ((batch_size + 7) / 8) as u32;
+        unsafe {
+            self.hip.launch_kernel(func, [m as u32, batch_tiles, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
+    /// HFQ2-G256 GEMV. K must be multiple of 256.
+    pub fn gemv_hfq2g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.ensure_kernel("gemv_hfq2g256", kernels::GEMV_HFQ2G256_SRC, "gemv_hfq2g256")?;
+        let func = &self.functions["gemv_hfq2g256"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// HFQ3-G256 GEMV. K must be multiple of 256.
+    pub fn gemv_hfq3g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.ensure_kernel("gemv_hfq3g256", kernels::GEMV_HFQ3G256_SRC, "gemv_hfq3g256")?;
+        let func = &self.functions["gemv_hfq3g256"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// HFQ6-G256 GEMV. K must be multiple of 256.
+    pub fn gemv_hfq6g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.ensure_kernel("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC, "gemv_hfq6g256")?;
+        let func = &self.functions["gemv_hfq6g256"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// HFQ8-G256 GEMV. K must be multiple of 256.
+    pub fn gemv_hfq8g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.ensure_kernel("gemv_hfq8g256", kernels::GEMV_HFQ8G256_SRC, "gemv_hfq8g256")?;
+        let func = &self.functions["gemv_hfq8g256"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// HFQ4-G512 GEMV. K must be multiple of 512.
+    pub fn gemv_hfq4g512(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.ensure_kernel("gemv_hfq4g512", kernels::GEMV_HFQ4G512_SRC, "gemv_hfq4g512")?;
+        let func = &self.functions["gemv_hfq4g512"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// HFQ4-G1024 GEMV. K must be multiple of 1024.
+    pub fn gemv_hfq4g1024(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.ensure_kernel("gemv_hfq4g1024", kernels::GEMV_HFQ4G1024_SRC, "gemv_hfq4g1024")?;
+        let func = &self.functions["gemv_hfq4g1024"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// HFQ4-G256 GEMV: flat 4-bit with 256-weight groups. K must be multiple of 256.
+    pub fn gemv_hfq4g256(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemv_hfq4g256", kernels::GEMV_HFQ4G256_SRC, "gemv_hfq4g256")?;
+        let func = &self.functions["gemv_hfq4g256"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+
+        // Use wide kernel (2 rows/block) for large M, narrow for small
+        if m >= 64 {
+            self.ensure_kernel("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC, "gemv_hfq4g256_wide")?;
+            let wfunc = &self.functions["gemv_hfq4g256_wide"];
+            let grid = ((m + 1) / 2) as u32;
+            unsafe {
+                self.hip.launch_kernel(wfunc, [grid, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
+            }
+        } else {
+            unsafe {
+                self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+            }
+        }
+    }
+
+    /// Batched HFQ4-G256 GEMM: y[b][row] = A[row] · x[b] for all batch elements.
+    /// x: [batch_size × K], y: [batch_size × M], both row-major.
+    pub fn gemm_hfq4g256(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemm_hfq4g256", kernels::GEMM_HFQ4G256_SRC, "gemm_hfq4g256")?;
+        let func = &self.functions["gemm_hfq4g256"];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let batch_tiles = ((batch_size + 7) / 8) as u32; // ceil(batch_size / BATCH_TILE=8)
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, batch_tiles, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -510,7 +810,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 0,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -593,7 +893,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -635,7 +935,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 0,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -676,7 +976,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -716,7 +1016,7 @@ impl Gpu {
                 [m as u32, 1, 1],
                 [block_size, 1, 1],
                 0,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -792,7 +1092,7 @@ impl Gpu {
                 [batch as u32, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -965,18 +1265,19 @@ impl Gpu {
                 [rows as u32, 1, 1],
                 [block, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
     }
 
     /// GPU-side RoPE (rotary positional embedding) applied in-place to Q and K.
+    /// pos_buf: GPU buffer containing a single i32 position value.
     pub fn rope_f32(
         &mut self,
         q: &GpuTensor,
         k: &GpuTensor,
-        pos: usize,
+        pos_buf: &DeviceBuffer,
         n_heads_q: usize,
         n_heads_k: usize,
         head_dim: usize,
@@ -987,7 +1288,7 @@ impl Gpu {
 
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k.buf.as_ptr();
-        let mut pos_val = pos as i32;
+        let mut pos_ptr = pos_buf.as_ptr();
         let mut nhq = n_heads_q as i32;
         let mut nhk = n_heads_k as i32;
         let mut hd = head_dim as i32;
@@ -996,7 +1297,7 @@ impl Gpu {
         let mut params: Vec<*mut c_void> = vec![
             &mut q_ptr as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
-            &mut pos_val as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
             &mut nhq as *mut _ as *mut c_void,
             &mut nhk as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
@@ -1013,20 +1314,58 @@ impl Gpu {
                 [grid, 1, 1],
                 [block, 1, 1],
                 0,
-                None,
+                self.stream_ref(),
                 &mut params,
             )
         }
     }
 
+    /// Batched RoPE: apply to [batch_size] positions in one launch.
+    /// q: [batch_size × q_dim], k: [batch_size × kv_dim].
+    /// positions: GPU buffer of [batch_size] i32 position indices.
+    pub fn rope_batched_f32(
+        &mut self, q: &GpuTensor, k: &GpuTensor, positions: &GpuTensor,
+        n_heads_q: usize, n_heads_k: usize, head_dim: usize, freq_base: f32, batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("rope_batched", kernels::ROPE_BATCHED_SRC, "rope_batched_f32")?;
+        let func = &self.functions["rope_batched_f32"];
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nhq = n_heads_q as i32;
+        let mut nhk = n_heads_k as i32;
+        let mut hd = head_dim as i32;
+        let mut fb = freq_base;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nhq as *mut _ as *mut c_void,
+            &mut nhk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let half = (head_dim / 2) as u32;
+        let block = 256u32.min(half);
+        let grid_x = (half + block - 1) / block;
+        unsafe {
+            self.hip.launch_kernel(func, [grid_x, batch_size as u32, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
+        }
+    }
+
     /// GPU-side GQA attention.
+    /// pos_buf: GPU buffer with single i32 position. Kernel computes seq_len = pos_buf[0] + 1.
+    /// seq_len_hint: host-side seq_len for shared memory sizing (= pos + 1).
     pub fn attention_f32(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
         v_cache: &GpuTensor,
         out: &GpuTensor,
-        seq_len: usize,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
@@ -1040,7 +1379,7 @@ impl Gpu {
         let mut k_ptr = k_cache.buf.as_ptr();
         let mut v_ptr = v_cache.buf.as_ptr();
         let mut out_ptr = out.buf.as_ptr();
-        let mut seq_val = seq_len as i32;
+        let mut pos_ptr = pos_buf.as_ptr();
         let mut nh = n_heads as i32;
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
@@ -1052,7 +1391,7 @@ impl Gpu {
             &mut k_ptr as *mut _ as *mut c_void,
             &mut v_ptr as *mut _ as *mut c_void,
             &mut out_ptr as *mut _ as *mut c_void,
-            &mut seq_val as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
@@ -1060,8 +1399,11 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
         ];
 
-        let block_size = (seq_len.max(head_dim) as u32).next_power_of_two().min(256);
-        let shared_mem = ((seq_len + block_size as usize) * 4) as u32;
+        // When a stream is active (graph capture mode), use max_seq for shared mem
+        // so the captured graph works for all sequence lengths.
+        let effective_seq = if self.active_stream.is_some() { max_seq } else { seq_len_hint };
+        let block_size = (effective_seq.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_mem = ((effective_seq + block_size as usize) * 4) as u32;
 
         unsafe {
             self.hip.launch_kernel(
@@ -1069,7 +1411,590 @@ impl Gpu {
                 [n_heads as u32, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Flash-decoding attention: split KV scan for long sequences.
+    /// Automatically chooses single-block or multi-block based on seq_len.
+    pub fn attention_flash(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        partials: &GpuTensor,
+        seq_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+    ) -> HipResult<()> {
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        // Choose chunk size: aim for 4-16 chunks
+        let chunk_size = if seq_len <= 128 { seq_len } else { 128 };
+        let n_chunks = (seq_len + chunk_size - 1) / chunk_size;
+
+        // Phase 1: compute partial attention per chunk
+        self.ensure_kernel("attention_flash_partial", kernels::ATTENTION_FLASH_SRC, "attention_flash_partial")?;
+        let func1 = &self.functions["attention_flash_partial"];
+
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut p_ptr = partials.buf.as_ptr();
+        let mut sl = seq_len as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ms = max_seq as i32;
+        let mut sc = scale;
+        let mut cs = chunk_size as i32;
+
+        let mut params1: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut p_ptr as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut cs as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 128u32.min(chunk_size as u32).next_power_of_two();
+        let shared_mem = ((chunk_size + block_size as usize) * 4) as u32;
+
+        unsafe {
+            self.hip.launch_kernel(
+                func1,
+                [n_heads as u32, n_chunks as u32, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params1,
+            )?;
+        }
+
+        // Phase 2: reduce partials
+        self.ensure_kernel("attention_flash_reduce", kernels::ATTENTION_FLASH_SRC, "attention_flash_reduce")?;
+        let func2 = &self.functions["attention_flash_reduce"];
+
+        let mut p_ptr2 = partials.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut nh2 = n_heads as i32;
+        let mut nc = n_chunks as i32;
+        let mut hd2 = head_dim as i32;
+
+        let mut params2: Vec<*mut c_void> = vec![
+            &mut p_ptr2 as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut nh2 as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut hd2 as *mut _ as *mut c_void,
+        ];
+
+        let reduce_block = head_dim.min(256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func2,
+                [n_heads as u32, 1, 1],
+                [reduce_block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params2,
+            )
+        }
+    }
+
+    /// Fused Gate+Up HFQ4-G256: two GEMVs in one launch.
+    pub fn fused_gate_up_hfq4g256(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor, x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("fused_gate_up_hfq4g256", kernels::FUSED_GATE_UP_HFQ4G256_SRC, "fused_gate_up_hfq4g256")?;
+        let func = &self.functions["fused_gate_up_hfq4g256"];
+        let mut ag = a_gate.buf.as_ptr();
+        let mut au = a_up.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yg = y_gate.buf.as_ptr();
+        let mut yu = y_up.buf.as_ptr();
+        let mut gm = gate_m as i32;
+        let mut um = up_m as i32;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag as *mut _ as *mut c_void, &mut au as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void, &mut yg as *mut _ as *mut c_void,
+            &mut yu as *mut _ as *mut c_void, &mut gm as *mut _ as *mut c_void,
+            &mut um as *mut _ as *mut c_void, &mut kv as *mut _ as *mut c_void,
+        ];
+        let total_rows = (gate_m + up_m) as u32;
+        unsafe { self.hip.launch_kernel(func, [total_rows, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Write KV to HFQ4 co-located block (72 bytes per head: scale+zero+nibbles).
+    pub fn kv_cache_write_hfq4(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_hfq4", kernels::KV_CACHE_WRITE_HFQ4_SRC, "kv_cache_write_hfq4")?;
+        let func = &self.functions["kv_cache_write_hfq4"];
+        let mut d = dst.buf.as_ptr(); let mut s = src.buf.as_ptr();
+        let mut p = pos_buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Attention with HFQ4 KV blocks (72 bytes per head, co-located).
+    pub fn attention_hfq4_kv(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_hfq4_kv", kernels::ATTENTION_HFQ4_KV_SRC, "attention_hfq4_kv")?;
+        let func = &self.functions["attention_hfq4_kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr(); let mut kp = k_cache.buf.as_ptr();
+        let mut vp = v_cache.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        // scores[seq_len] + ws[block_size] + q_shared[head_dim]
+        let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// INT8 co-located with f16 scale (matches Q8_0 precision, one block per head).
+    pub fn kv_cache_write_int8c_f16(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_int8c_f16", kernels::KV_CACHE_WRITE_INT8C_F16_SRC, "kv_cache_write_int8c_f16")?;
+        let func = &self.functions["kv_cache_write_int8c_f16"];
+        let mut d = dst.buf.as_ptr(); let mut s = src.buf.as_ptr(); let mut p = pos_buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    pub fn attention_int8c_f16_kv(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_int8c_f16_kv", kernels::ATTENTION_INT8C_F16_KV_SRC, "attention_int8c_f16_kv")?;
+        let func = &self.functions["attention_int8c_f16_kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr(); let mut kp = k_cache.buf.as_ptr();
+        let mut vp = v_cache.buf.as_ptr(); let mut op = out.buf.as_ptr(); let mut pp = pos_buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// Write KV to INT8 co-located block (f32 scale + int8 data, symmetric).
+    pub fn kv_cache_write_int8c(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_int8c", kernels::KV_CACHE_WRITE_INT8C_SRC, "kv_cache_write_int8c")?;
+        let func = &self.functions["kv_cache_write_int8c"];
+        let mut d = dst.buf.as_ptr(); let mut s = src.buf.as_ptr();
+        let mut p = pos_buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Attention with INT8 co-located KV blocks.
+    pub fn attention_int8c_kv(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_int8c_kv", kernels::ATTENTION_INT8C_KV_SRC, "attention_int8c_kv")?;
+        let func = &self.functions["attention_int8c_kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr(); let mut kp = k_cache.buf.as_ptr();
+        let mut vp = v_cache.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// Write KV to HFQ8 cache (FP32 scale+zero, contiguous uint8).
+    pub fn kv_cache_write_hfq8(
+        &mut self, dst_data: &GpuTensor, dst_scales: &GpuTensor, src: &GpuTensor,
+        pos_buf: &DeviceBuffer, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_hfq8", kernels::KV_CACHE_WRITE_HFQ8_SRC, "kv_cache_write_hfq8")?;
+        let func = &self.functions["kv_cache_write_hfq8"];
+        let mut dd = dst_data.buf.as_ptr(); let mut ds = dst_scales.buf.as_ptr();
+        let mut s = src.buf.as_ptr(); let mut p = pos_buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dd as *mut _ as *mut c_void, &mut ds as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void, &mut p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Attention with HFQ8 KV cache.
+    pub fn attention_hfq8_kv(
+        &mut self, q: &GpuTensor,
+        k_data: &GpuTensor, k_scales: &GpuTensor,
+        v_data: &GpuTensor, v_scales: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_hfq8_kv", kernels::ATTENTION_HFQ8_KV_SRC, "attention_hfq8_kv")?;
+        let func = &self.functions["attention_hfq8_kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr();
+        let mut kd = k_data.buf.as_ptr(); let mut ks = k_scales.buf.as_ptr();
+        let mut vd = v_data.buf.as_ptr(); let mut vs = v_scales.buf.as_ptr();
+        let mut op = out.buf.as_ptr(); let mut pp = pos_buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kd as *mut _ as *mut c_void, &mut ks as *mut _ as *mut c_void,
+            &mut vd as *mut _ as *mut c_void, &mut vs as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void, &mut pp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// Write KV to INT8 cache (separate scale array).
+    pub fn kv_cache_write_int8(
+        &mut self, dst_vals: &GpuTensor, dst_scales: &GpuTensor, src: &GpuTensor,
+        pos_buf: &DeviceBuffer, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_int8", kernels::KV_CACHE_WRITE_INT8_SRC, "kv_cache_write_int8")?;
+        let func = &self.functions["kv_cache_write_int8"];
+        let mut dv = dst_vals.buf.as_ptr(); let mut ds = dst_scales.buf.as_ptr();
+        let mut s = src.buf.as_ptr(); let mut p = pos_buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dv as *mut _ as *mut c_void, &mut ds as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void, &mut p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Attention with INT8 KV (separate scale array).
+    pub fn attention_int8_kv(
+        &mut self, q: &GpuTensor,
+        k_vals: &GpuTensor, k_scales: &GpuTensor,
+        v_vals: &GpuTensor, v_scales: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_int8_kv", kernels::ATTENTION_INT8_KV_SRC, "attention_int8_kv")?;
+        let func = &self.functions["attention_int8_kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut kv_ptr = k_vals.buf.as_ptr(); let mut ks_ptr = k_scales.buf.as_ptr();
+        let mut vv_ptr = v_vals.buf.as_ptr(); let mut vs_ptr = v_scales.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr(); let mut pos_ptr = pos_buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut kv_ptr as *mut _ as *mut c_void, &mut ks_ptr as *mut _ as *mut c_void,
+            &mut vv_ptr as *mut _ as *mut c_void, &mut vs_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void, &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// Batched causal attention: all query positions in one launch.
+    /// Q: [seq_len × n_heads × head_dim], K/V: [seq_len × n_kv_heads × head_dim].
+    pub fn attention_causal_batched(
+        &mut self, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, out: &GpuTensor,
+        seq_len: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_causal_batched", kernels::ATTENTION_CAUSAL_BATCHED_SRC, "attention_causal_batched")?;
+        let func = &self.functions["attention_causal_batched"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr(); let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut sl = seq_len as i32; let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Block size: enough threads to cover head_dim and seq_len
+        let block_size = 128u32.min((seq_len.max(head_dim) as u32).next_power_of_two());
+        // Shared: scores[seq_len] + workspace[block_size]
+        let shared_mem = ((seq_len + block_size as usize) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, seq_len as u32, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// Batched Q8_0 KV cache write: quantize multiple positions in one launch.
+    pub fn kv_cache_write_q8_0_batched(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, positions: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_q8_0_batched", kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC, "kv_cache_write_q8_0_batched")?;
+        let func = &self.functions["kv_cache_write_q8_0_batched"];
+        let mut d = dst.buf.as_ptr(); let mut s = src.buf.as_ptr();
+        let mut p = positions.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32; let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut bs as *mut _ as *mut c_void,
+        ];
+        let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        unsafe { self.hip.launch_kernel(func, [total_blocks, batch_size as u32, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Write KV vector to Q8_0 quantized cache (same format as GGML Q8_0).
+    pub fn kv_cache_write_q8_0(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_q8_0", kernels::KV_CACHE_WRITE_Q8_0_SRC, "kv_cache_write_q8_0")?;
+        let func = &self.functions["kv_cache_write_q8_0"];
+        let mut d = dst.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut p = pos_buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        unsafe { self.hip.launch_kernel(func, [total_blocks, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Attention with Q8_0 quantized KV cache.
+    pub fn attention_q8_0_kv(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_q8_0_kv", kernels::ATTENTION_Q8_0_KV_SRC, "attention_q8_0_kv")?;
+        let func = &self.functions["attention_q8_0_kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr(); let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr(); let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = pos_buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void, &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void, &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        // Extra shared mem for Q head vector preloaded into shared memory
+        let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// Write KV vector to Q8 (int8 symmetric) quantized cache.
+    pub fn kv_cache_write_q8(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_q8", kernels::KV_CACHE_WRITE_Q8_SRC, "kv_cache_write_q8")?;
+        let func = &self.functions["kv_cache_write_q8"];
+        let mut d = dst.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut p = pos_buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let block = 64u32.min(head_dim as u32);
+        let shared = (block * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [block, 1, 1], shared, self.stream_ref(), &mut params) }
+    }
+
+    /// Attention with Q8 quantized KV cache.
+    pub fn attention_q8kv(
+        &mut self, q: &GpuTensor, k_cache_q8: &GpuTensor, v_cache_q8: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_q8kv", kernels::ATTENTION_Q8KV_SRC, "attention_q8kv")?;
+        let func = &self.functions["attention_q8kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr(); let mut k_ptr = k_cache_q8.buf.as_ptr();
+        let mut v_ptr = v_cache_q8.buf.as_ptr(); let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = pos_buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void, &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void, &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// Write KV vector to quantized HFQ4 cache.
+    pub fn kv_cache_write_q4(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_q4", kernels::KV_CACHE_WRITE_Q4_SRC, "kv_cache_write_q4")?;
+        let func = &self.functions["kv_cache_write_q4"];
+        let mut d = dst.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut p = pos_buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let block = 64u32.min(head_dim as u32);
+        let shared = (block * 2 * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [block, 1, 1], shared, self.stream_ref(), &mut params) }
+    }
+
+    /// Attention with quantized HFQ4 KV cache — dequantizes K/V on the fly.
+    pub fn attention_q4kv(
+        &mut self, q: &GpuTensor, k_cache_q4: &GpuTensor, v_cache_q4: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_q4kv", kernels::ATTENTION_Q4KV_SRC, "attention_q4kv")?;
+        let func = &self.functions["attention_q4kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache_q4.buf.as_ptr();
+        let mut v_ptr = v_cache_q4.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = pos_buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ms = max_seq as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void, &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void, &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// GPU-side KV cache write. Copies kv_dim floats from src to dst[pos_buf[0] * kv_dim].
+    pub fn kv_cache_write(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        kv_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write", kernels::KV_CACHE_WRITE_SRC, "kv_cache_write")?;
+        let func = &self.functions["kv_cache_write"];
+
+        let mut dst_ptr = dst.buf.as_ptr();
+        let mut src_ptr = src.buf.as_ptr();
+        let mut pos_ptr = pos_buf.as_ptr();
+        let mut kd = kv_dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dst_ptr as *mut _ as *mut c_void,
+            &mut src_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut kd as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = (kv_dim as u32 + block - 1) / block;
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
                 &mut params,
             )
         }
@@ -1081,32 +2006,40 @@ impl Gpu {
         &mut self,
         logits: &GpuTensor,
         result_buf: &GpuTensor,
+        repeat_buf: &GpuTensor,
         vocab_size: usize,
         temperature: f32,
         top_p: f32,
         rng_state: u32,
+        repeat_window: usize,
+        repeat_penalty: f32,
     ) -> HipResult<(u32, u32)> {
         self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
         let func = &self.functions["sample_top_p"];
 
         let mut logits_ptr = logits.buf.as_ptr();
         let mut result_ptr = result_buf.buf.as_ptr();
+        let mut repeat_ptr = repeat_buf.buf.as_ptr();
         let mut vs = vocab_size as i32;
         let mut temp = temperature;
         let mut tp = top_p;
         let mut rng = rng_state;
+        let mut rw = repeat_window as i32;
+        let mut rp = repeat_penalty;
 
         let mut params: Vec<*mut std::ffi::c_void> = vec![
             &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
             &mut result_ptr as *mut _ as *mut std::ffi::c_void,
+            &mut repeat_ptr as *mut _ as *mut std::ffi::c_void,
             &mut vs as *mut _ as *mut std::ffi::c_void,
             &mut temp as *mut _ as *mut std::ffi::c_void,
             &mut tp as *mut _ as *mut std::ffi::c_void,
             &mut rng as *mut _ as *mut std::ffi::c_void,
+            &mut rw as *mut _ as *mut std::ffi::c_void,
+            &mut rp as *mut _ as *mut std::ffi::c_void,
         ];
 
         let block_size = 256u32;
-        // Shared: reduce[256] + cand_scores[512] + cand_indices[512] + count[1]
         let shared_mem = (256 + 512 + 512 + 1) * 4;
 
         unsafe {
@@ -1115,16 +2048,68 @@ impl Gpu {
                 [1, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
-                None,
+                self.stream_ref(),
                 &mut params,
             )?;
         }
 
-        // Download just 8 bytes: token_id + rng_state
         let mut out = [0u8; 8];
         self.hip.memcpy_dtoh(&mut out, &result_buf.buf)?;
         let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
         let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
         Ok((token_id, new_rng))
+    }
+
+    /// Launch sampling kernel only (no readback). For use during graph capture.
+    pub fn sample_top_p_launch(
+        &mut self,
+        logits: &GpuTensor,
+        result_buf: &GpuTensor,
+        repeat_buf: &GpuTensor,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+        repeat_window: usize,
+        repeat_penalty: f32,
+    ) -> HipResult<()> {
+        self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
+        let func = &self.functions["sample_top_p"];
+
+        let mut logits_ptr = logits.buf.as_ptr();
+        let mut result_ptr = result_buf.buf.as_ptr();
+        let mut repeat_ptr = repeat_buf.buf.as_ptr();
+        let mut vs = vocab_size as i32;
+        let mut temp = temperature;
+        let mut tp = top_p;
+        let mut rng = rng_state;
+        let mut rw = repeat_window as i32;
+        let mut rp = repeat_penalty;
+
+        let mut params: Vec<*mut std::ffi::c_void> = vec![
+            &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
+            &mut result_ptr as *mut _ as *mut std::ffi::c_void,
+            &mut repeat_ptr as *mut _ as *mut std::ffi::c_void,
+            &mut vs as *mut _ as *mut std::ffi::c_void,
+            &mut temp as *mut _ as *mut std::ffi::c_void,
+            &mut tp as *mut _ as *mut std::ffi::c_void,
+            &mut rng as *mut _ as *mut std::ffi::c_void,
+            &mut rw as *mut _ as *mut std::ffi::c_void,
+            &mut rp as *mut _ as *mut std::ffi::c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared_mem = (256 + 512 + 512 + 1) * 4;
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
     }
 }

@@ -20,8 +20,10 @@ version = "0.1.0"
 dependencies = [
  "byteorder",
  "hip-bridge",
+ "libc",
  "memmap2",
  "rdna-compute",
+ "serde",
  "serde_json",
 ]
 
