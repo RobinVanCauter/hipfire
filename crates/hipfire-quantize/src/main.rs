@@ -614,6 +614,72 @@ fn is_q8_tensor(name: &str) -> bool {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
+/// Resolve a model input to a local directory path.
+/// Accepts: local path, HuggingFace model ID (org/name), or HF cache path.
+/// If the input looks like a HF model ID and isn't a local path, tries to find it
+/// in the HF cache or downloads it via huggingface-cli.
+fn resolve_model_path(input: &str) -> String {
+    let path = Path::new(input);
+
+    // If it's already a valid local directory with config.json, use it directly
+    if path.join("config.json").exists() {
+        return input.to_string();
+    }
+
+    // Check if it looks like a HuggingFace model ID (contains exactly one /)
+    if input.contains('/') && !input.contains(std::path::MAIN_SEPARATOR) || (cfg!(unix) && input.matches('/').count() == 1) {
+        let parts: Vec<&str> = input.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            let org = parts[0];
+            let name = parts[1];
+
+            // Check HF cache: ~/.cache/huggingface/hub/models--{org}--{name}/snapshots/*/
+            let home = std::env::var("HOME").unwrap_or_default();
+            let cache_dir = format!("{home}/.cache/huggingface/hub/models--{org}--{name}");
+            let snapshots_dir = Path::new(&cache_dir).join("snapshots");
+
+            if snapshots_dir.exists() {
+                // Find the first snapshot directory
+                if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
+                    for entry in entries.flatten() {
+                        let snap_path = entry.path();
+                        if snap_path.is_dir() && snap_path.join("config.json").exists() {
+                            eprintln!("Resolved {input} -> {}", snap_path.display());
+                            return snap_path.to_string_lossy().to_string();
+                        }
+                    }
+                }
+            }
+
+            // Not in cache — try to download
+            eprintln!("Model {input} not found locally. Downloading via huggingface-cli...");
+            let status = std::process::Command::new("huggingface-cli")
+                .args(["download", input])
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    // Retry cache lookup after download
+                    if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
+                        for entry in entries.flatten() {
+                            let snap_path = entry.path();
+                            if snap_path.is_dir() && snap_path.join("config.json").exists() {
+                                eprintln!("Downloaded {input} -> {}", snap_path.display());
+                                return snap_path.to_string_lossy().to_string();
+                            }
+                        }
+                    }
+                }
+                Ok(s) => eprintln!("huggingface-cli download failed with status {s}"),
+                Err(e) => eprintln!("Failed to run huggingface-cli: {e}. Install with: pip install huggingface_hub"),
+            }
+        }
+    }
+
+    // Fall through: return as-is, will fail at config.json read with a helpful error
+    input.to_string()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -641,19 +707,22 @@ fn main() {
     let use_q4k_q8embed = format == "q4k-q8embed";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4";
 
-    let input_dir = Path::new(input_dir);
+    // Resolve input: local path or HuggingFace model ID (e.g. "Qwen/Qwen3-8B")
+    let input_dir = resolve_model_path(input_dir);
+    let input_dir = Path::new(&input_dir);
     let output_path = Path::new(output_path);
 
     // Read model config
     let config_path = input_dir.join("config.json");
     let config_str = std::fs::read_to_string(&config_path)
-        .unwrap_or_else(|_| panic!("Cannot read {}", config_path.display()));
+        .unwrap_or_else(|_| panic!("Cannot read {}. If using a HuggingFace model ID, ensure it's downloaded: huggingface-cli download {}", config_path.display(), input_dir.display()));
     let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
 
     let arch_str = config.get("model_type").and_then(|v| v.as_str()).unwrap_or("llama");
     let arch_id = match arch_str {
         "llama" => 0u32,
         "qwen3" | "qwen2" => 1,
+        "qwen3_5" | "qwen3_5_text" => 5,
         other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
     };
     eprintln!("Architecture: {arch_str} (id={arch_id})");
@@ -666,11 +735,22 @@ fn main() {
         None
     };
 
+    // Read tokenizer_config.json (has chat_template)
+    let tokenizer_config_path = input_dir.join("tokenizer_config.json");
+    let tokenizer_config: Option<serde_json::Value> = if tokenizer_config_path.exists() {
+        std::fs::read_to_string(&tokenizer_config_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    } else {
+        None
+    };
+
     // Build metadata JSON for .hfq
     let metadata = serde_json::json!({
         "architecture": arch_str,
         "config": config,
         "tokenizer": tokenizer_str.as_deref().unwrap_or("{}"),
+        "tokenizer_config": tokenizer_config,
     });
     let metadata_json = serde_json::to_string(&metadata).unwrap();
 

@@ -16,7 +16,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "hip-bridge",
@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "hip-bridge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libloading",
  "thiserror",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-quantize"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "memmap2",
@@ -102,7 +102,7 @@ dependencies = [
 
 [[package]]
 name = "rdna-compute"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hip-bridge",
 ]
