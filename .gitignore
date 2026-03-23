@@ -17,6 +17,11 @@ results.tsv
 *.hfq
 *.safetensors
 
+# Benchmark result data
+bench/results/*.json
+bench/results/*.txt
+bench/results/*.md
+
 # Tool configs
 .serena/
 models/
