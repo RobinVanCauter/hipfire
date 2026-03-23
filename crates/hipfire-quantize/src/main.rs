@@ -781,7 +781,17 @@ fn main() {
     let mut max_quant_error = 0.0f32;
     let mut _n_quant_groups = 0u64;
 
+    let mut skipped_params = 0u64;
     for (name, file_idx) in &all_tensors {
+        // Skip VLM vision encoder and MTP head — not needed for text inference
+        if name.starts_with("model.visual.") || name.starts_with("visual.")
+            || name.starts_with("mtp.") {
+            let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n: usize = meta.shape.iter().product();
+            skipped_params += n as u64;
+            continue;
+        }
+
         let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
         let n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
@@ -850,12 +860,17 @@ fn main() {
 
             let (quantized, qt, gs, label) = if use_hfq4g256 {
                 // Auto-select G128 vs G256 based on K dimension
-                // G256 for K >= 4096 (better coalescing), G128 for smaller K (better quality)
+                // G256 preferred: better coalescing, fewer scale/zero overheads
+                // G128 only as fallback when K isn't divisible by 256
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim >= 4096 && k_dim % 256 == 0 {
+                if k_dim % 256 == 0 {
                     let q = quantize_hfq4g256(&f32_data);
                     (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                } else if k_dim % 128 == 0 {
+                    let q = quantize_hfq4g128(&f32_data);
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                 } else {
+                    // Pad to 128-element boundary
                     let q = quantize_hfq4g128(&f32_data);
                     (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                 }
@@ -977,6 +992,9 @@ fn main() {
     } else { 0.0 };
 
     eprintln!("\n=== Quantization Summary ===");
+    if skipped_params > 0 {
+        eprintln!("  Skipped params:   {skipped_params} (visual/mtp — not needed for text)");
+    }
     eprintln!("  Total params:     {total_params}");
     eprintln!("  Quantized params: {quantized_params} ({:.1}%)", 100.0 * quantized_params as f64 / total_params as f64);
     eprintln!("  Mean quant error: {mean_quant_error:.8}");

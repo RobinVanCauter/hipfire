@@ -468,22 +468,48 @@ pub fn forward(
                 // Scale Q by 1/sqrt(S_k) before recurrence (all on GPU)
                 gpu.scale_f32(&q_part, 1.0 / (config.linear_key_head_dim as f32).sqrt())?;
 
+                // Repeat Q/K heads if num_k_heads < num_v_heads (GQA-style)
+                let (q_gdn, k_gdn) = if config.linear_num_key_heads < n_v_heads {
+                    let ratio = n_v_heads / config.linear_num_key_heads;
+                    let expanded_dim = n_v_heads * config.linear_key_head_dim;
+                    let q_exp = gpu.alloc_tensor(&[expanded_dim], DType::F32)?;
+                    let k_exp = gpu.alloc_tensor(&[expanded_dim], DType::F32)?;
+                    let hd = config.linear_key_head_dim;
+                    for kh in 0..config.linear_num_key_heads {
+                        for r in 0..ratio {
+                            let dst = (kh * ratio + r) * hd * 4;
+                            let src = kh * hd * 4;
+                            gpu.hip.memcpy_dtod_at(&q_exp.buf, dst, &q_part.buf, src, hd * 4)?;
+                            gpu.hip.memcpy_dtod_at(&k_exp.buf, dst, &k_part.buf, src, hd * 4)?;
+                        }
+                    }
+                    (q_exp, k_exp)
+                } else {
+                    // Same number of heads — no repeat needed, reuse buffers directly
+                    // (we'll skip freeing these in the cleanup below)
+                    let q_ref = gpu.alloc_tensor(&[k_dim], DType::F32)?;
+                    let k_ref = gpu.alloc_tensor(&[k_dim], DType::F32)?;
+                    gpu.hip.memcpy_dtod_at(&q_ref.buf, 0, &q_part.buf, 0, k_dim * 4)?;
+                    gpu.hip.memcpy_dtod_at(&k_ref.buf, 0, &k_part.buf, 0, k_dim * 4)?;
+                    (q_ref, k_ref)
+                };
+
                 // Gated Delta Net recurrence
                 let attn_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
                 match dn_state.quant {
                     StateQuant::FP32 => gpu.gated_delta_net_f32(
-                        &q_part, &k_part, &v_part, &alpha_out, &beta_out,
+                        &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
                         &dn_state.s_matrices[delta_layer_idx], &attn_out,
                         1, n_v_heads, config.linear_value_head_dim,
                     )?,
                     StateQuant::Q8 => gpu.gated_delta_net_q8(
-                        &q_part, &k_part, &v_part, &alpha_out, &beta_out,
+                        &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
                         &dn_state.s_matrices[delta_layer_idx],
                         &dn_state.s_scales[delta_layer_idx], &attn_out,
                         1, n_v_heads, config.linear_value_head_dim,
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
-                        &q_part, &k_part, &v_part, &alpha_out, &beta_out,
+                        &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
                         &dn_state.s_matrices[delta_layer_idx],
                         &dn_state.s_scales[delta_layer_idx], &attn_out,
                         1, n_v_heads, config.linear_value_head_dim,
@@ -519,7 +545,7 @@ pub fn forward(
                 gpu.add_inplace_f32(&x, &ffn_out)?;
 
                 // Free temporaries
-                for t in [qkv, z, beta_out, alpha_out, conv_out, q_part, k_part, v_part, attn_out, normed_out, o, gate, up, ffn_hidden, ffn_out] {
+                for t in [qkv, z, beta_out, alpha_out, conv_out, q_part, k_part, v_part, q_gdn, k_gdn, attn_out, normed_out, o, gate, up, ffn_hidden, ffn_out] {
                     gpu.free_tensor(t)?;
                 }
                 delta_layer_idx += 1;
