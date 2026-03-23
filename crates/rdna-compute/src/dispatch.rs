@@ -2236,8 +2236,7 @@ impl Gpu {
             &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
         ];
         // 128 threads = 4 warps of 32. One thread per row of S.
-        // Shared memory: 128×128×4 = 64KB for S matrix.
-        let shared = (head_dim * head_dim * 4) as u32;
-        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 4, 1], shared, self.stream_ref(), &mut params) }
+        // S matrix in global memory (fits in L2 cache).
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 4, 1], 0, self.stream_ref(), &mut params) }
     }
 }
