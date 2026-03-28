@@ -25,6 +25,7 @@ fn main() {
     let use_q8kv = args.iter().any(|a| a == "--q8kv");
     let use_fp32kv = args.iter().any(|a| a == "--fp32kv");
     let use_hfq4kv = args.iter().any(|a| a == "--hfq4kv");
+    let use_adaptive = args.iter().any(|a| a == "--adaptive");
     let use_hfq4skv = args.iter().any(|a| a == "--hfq4skv");
     let temp: f32 = args.iter().position(|a| a == "--temp")
         .map(|i| args[i + 1].parse().unwrap_or(0.6))
@@ -32,7 +33,7 @@ fn main() {
     let top_p: f32 = if temp == 0.0 { 1.0 } else { 0.8 };
 
     let prompt_text = {
-        let skip_flags = ["--q8kv", "--fp32kv", "--hfq4kv", "--hfq4skv", "--temp", "--maxgen"];
+        let skip_flags = ["--q8kv", "--fp32kv", "--hfq4kv", "--hfq4skv", "--adaptive", "--temp", "--maxgen"];
         let mut skip_next = false;
         let parts: Vec<&str> = args[2..].iter().filter(|a| {
             if skip_next { skip_next = false; return false; }
@@ -108,7 +109,7 @@ fn main() {
     // KV cache
     let kv_seq_len = config.max_seq_len.min(2048);
     let mut kv_cache = if turbo_bits > 0 {
-        KvCache::new_gpu_turbo(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len, turbo_bits).unwrap()
+        KvCache::new_gpu_turbo_adaptive(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len, turbo_bits, use_adaptive).unwrap()
     } else if use_hfq4skv {
         KvCache::new_gpu_hfq4s_kv(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     } else if use_hfq4kv {

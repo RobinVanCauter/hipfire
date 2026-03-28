@@ -1038,6 +1038,15 @@ pub fn forward_scratch_layers(
                 &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
             )?;
+        } else if kv_cache.quant_turbo > 0 && kv_cache.turbo_adaptive
+                 && (layer_idx == 0 || layer_idx == config.n_layers - 1) {
+            // Layer-adaptive: first/last layers use FP32 KV for max quality
+            gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
+            gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
+            gpu.attention_f32(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
         } else if kv_cache.quant_turbo > 0 {
             let s1 = kv_cache.turbo_signs1.as_ref().unwrap();
             let s2 = kv_cache.turbo_signs2.as_ref().unwrap();
@@ -1188,6 +1197,15 @@ pub fn forward_scratch_compute(
             gpu.kv_cache_write_int8c_f16(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.kv_cache_write_int8c_f16(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
             gpu.attention_int8c_f16_kv(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else if kv_cache.quant_turbo > 0 && kv_cache.turbo_adaptive
+                 && (layer_idx == 0 || layer_idx == config.n_layers - 1) {
+            // Layer-adaptive: first/last layers use FP32 KV for max quality
+            gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
+            gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
+            gpu.attention_f32(
                 &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
             )?;
@@ -1632,6 +1650,7 @@ pub struct KvCache {
     pub quant_hfq4: bool,        // true = HFQ4 co-located blocks (72 bytes/head)
     pub quant_hfq4s: bool,       // true = HFQ4 + sign-flip decorrelation
     pub quant_turbo: u8,         // 0=off, 2=turbo_hfq2, 3=turbo_hfq3, 4=turbo_hfq4
+    pub turbo_adaptive: bool,    // true = first/last layers use FP32 KV
     pub turbo_signs1: Option<GpuTensor>,  // FWHT sign table 1 (128 × f32, ±1.0)
     pub turbo_signs2: Option<GpuTensor>,  // FWHT sign table 2 (128 × f32, ±1.0)
 }
@@ -1652,7 +1671,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
     }
 
     /// Create quantized KV cache (HFQ4-G128). 3.56x smaller than FP32.
@@ -1676,7 +1695,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
     }
 
     /// Create Q8_0 quantized KV cache (GGML Q8_0 format). 3.76x smaller than FP32.
@@ -1696,7 +1715,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
     }
 
     /// Create INT8 co-located KV cache: [f32 scale][pad 4B][int8 × head_dim] = 136 bytes per head.
@@ -1714,7 +1733,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
     }
 
     /// Create HFQ4 KV cache: co-located blocks. 72 bytes per head (scale+zero+nibbles).
@@ -1732,7 +1751,7 @@ impl KvCache {
             k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_hfq4s: false, quant_turbo: 0, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
     }
 
     /// Create HFQ4 KV cache with sign-flip decorrelation. Same format, better quality.
@@ -1751,7 +1770,7 @@ impl KvCache {
             v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
         }
         eprintln!("KV cache: HFQ4+sign (72B/head, 7.1x vs fp32)");
-        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: true, quant_turbo: 0, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: true, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
     }
 
     /// Create HFQ8 KV cache: FP32 scale+zero per head, contiguous uint8 data.
@@ -1771,7 +1790,7 @@ impl KvCache {
             k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
             v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
     }
 
     /// Create INT8 KV cache with separate scale arrays. Clean contiguous layout.
@@ -1793,7 +1812,7 @@ impl KvCache {
             k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
             v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
         }
-        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_signs1: None, turbo_signs2: None })
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_hfq4s: false, quant_turbo: 0, turbo_adaptive: false, turbo_signs1: None, turbo_signs2: None })
     }
 
     /// Create TurboQuant KV cache. `bits` = 2, 3, or 4.
@@ -1802,48 +1821,61 @@ impl KvCache {
         gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
         bits: u8,
     ) -> HipResult<Self> {
-        assert!(bits == 2 || bits == 3 || bits == 4, "turbo bits must be 2, 3, or 4");
+        Self::new_gpu_turbo_adaptive(gpu, n_layers, n_kv_heads, head_dim, max_seq_len, bits, false)
+    }
+
+    /// Create TurboQuant KV cache with optional layer-adaptive mode.
+    /// When adaptive=true, first and last layers use FP32 KV for max quality.
+    pub fn new_gpu_turbo_adaptive(
+        gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
+        bits: u8, adaptive: bool,
+    ) -> HipResult<Self> {
+        let real_bits = if bits == 12 { 2u8 } else { bits };
+        assert!(real_bits == 2 || real_bits == 3 || real_bits == 4, "turbo bits must be 2, 3, 4, or 12");
         assert!(head_dim == 128, "turbo KV cache requires head_dim=128 (got {head_dim})");
 
         let kv_dim = n_kv_heads * head_dim;
-        let bytes_per_head = match bits {
-            2 => 4 + head_dim / 4,      // 36 for hd=128
-            3 => 4 + head_dim / 4 + head_dim / 8, // 52 for hd=128
-            4 => 4 + head_dim / 2,       // 68 for hd=128
+        let turbo_bytes_per_head = match real_bits {
+            2 => 4 + head_dim / 4,
+            3 => 4 + head_dim / 4 + head_dim / 8,
+            4 => 4 + head_dim / 2,
             _ => unreachable!(),
         };
-        let bytes_per_pos = n_kv_heads * bytes_per_head;
-        let cache_bytes = max_seq_len * bytes_per_pos;
-        let cache_elems = (cache_bytes + 3) / 4;
+        let fp32_bytes_per_pos = max_seq_len * kv_dim * 4;
+        let fp32_elems = kv_dim * max_seq_len;
+        let turbo_bytes_per_pos = n_kv_heads * turbo_bytes_per_head;
+        let turbo_cache_bytes = max_seq_len * turbo_bytes_per_pos;
+        let turbo_elems = (turbo_cache_bytes + 3) / 4;
 
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+        for layer in 0..n_layers {
+            let is_edge = adaptive && (layer == 0 || layer == n_layers - 1);
+            let elems = if is_edge { fp32_elems } else { turbo_elems };
+            k_gpu.push(gpu.zeros(&[elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[elems], DType::F32)?);
         }
 
-        // Generate deterministic FWHT sign tables (matching TurboQuant paper)
         let signs1 = Self::gen_fwht_signs(42, head_dim);
         let signs2 = Self::gen_fwht_signs(1042, head_dim);
-        let signs1_bytes: Vec<u8> = signs1.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let signs2_bytes: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1b: Vec<u8> = signs1.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let mut s1t = gpu.alloc_tensor(&[head_dim], DType::F32)?;
+        let mut s2t = gpu.alloc_tensor(&[head_dim], DType::F32)?;
+        gpu.hip.memcpy_htod(&s1t.buf, &s1b)?;
+        gpu.hip.memcpy_htod(&s2t.buf, &s2b)?;
 
-        let mut s1_tensor = gpu.alloc_tensor(&[head_dim], DType::F32)?;
-        let mut s2_tensor = gpu.alloc_tensor(&[head_dim], DType::F32)?;
-        gpu.hip.memcpy_htod(&s1_tensor.buf, &signs1_bytes)?;
-        gpu.hip.memcpy_htod(&s2_tensor.buf, &signs2_bytes)?;
-
-        eprintln!("KV cache: turbo_hfq{bits} ({bytes_per_head}B/head, {:.1}x vs fp32)",
-            (head_dim * 4) as f64 / bytes_per_head as f64);
+        let label = if adaptive { format!("turbo_hfq{bits}+adaptive") } else { format!("turbo_hfq{bits}") };
+        eprintln!("KV cache: {label} ({turbo_bytes_per_head}B/head turbo, {:.1}x vs fp32{})",
+            (head_dim * 4) as f64 / turbo_bytes_per_head as f64,
+            if adaptive { ", layers 0+last=FP32" } else { "" });
 
         Ok(Self {
             k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
             max_seq: max_seq_len, n_kv_heads, head_dim,
             quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_hfq4s: false,
-            quant_turbo: bits,
-            turbo_signs1: Some(s1_tensor),
-            turbo_signs2: Some(s2_tensor),
+            quant_turbo: bits, turbo_adaptive: adaptive,
+            turbo_signs1: Some(s1t), turbo_signs2: Some(s2t),
         })
     }
 
