@@ -1236,12 +1236,11 @@ pub fn forward_early_exit(
             gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
             weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
-            // GPU-side argmax to find max logit, download just the max value
-            // For now: download logits and check on CPU (optimize later)
-            let logits = gpu.download_f32(&scratch.logits)?;
-            let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let sum_exp: f64 = logits.iter().map(|&l| ((l - max_logit) as f64).exp()).sum();
-            let max_prob = (1.0 / sum_exp) as f32; // prob of argmax token
+            // GPU-side confidence check: compute max(softmax) on GPU, download 4 bytes
+            gpu.max_prob(&scratch.logits, &scratch.sample_buf, config.vocab_size)?;
+            let mut prob_bytes = [0u8; 4];
+            gpu.hip.memcpy_dtoh(&mut prob_bytes, &scratch.sample_buf.buf)?;
+            let max_prob = f32::from_ne_bytes(prob_bytes);
 
             if max_prob >= exit_threshold {
                 exit_layer = layer_idx + 1;

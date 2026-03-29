@@ -684,6 +684,24 @@ impl Gpu {
         }
     }
 
+    /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
+    pub fn max_prob(
+        &mut self, logits: &GpuTensor, result: &GpuTensor, vocab_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("max_prob", kernels::MAX_PROB_SRC, "max_prob")?;
+        let func = &self.functions["max_prob"];
+        let mut lp = logits.buf.as_ptr();
+        let mut rp = result.buf.as_ptr();
+        let mut vs = vocab_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void, &mut rp as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let shared = (block * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [1, 1, 1], [block, 1, 1], shared, self.stream_ref(), &mut params) }
+    }
+
     /// Fused QKV: three Q4_K GEMVs in one launch (saves 2 kernel launches per layer).
     /// q = Wq * x, k = Wk * x, v = Wv * x — all read the same input x.
     #[allow(clippy::too_many_arguments)]
