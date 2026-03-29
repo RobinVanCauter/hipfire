@@ -1128,6 +1128,145 @@ pub fn forward_scratch_layers(
     )
 }
 
+/// Early-exit forward pass: check confidence at checkpoint layers, skip rest if confident.
+/// Returns (token_id, rng_state, exit_layer) — exit_layer is which layer triggered the exit.
+/// If no early exit, exit_layer = n_layers (ran all layers normally).
+pub fn forward_early_exit(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    temperature: f32,
+    top_p: f32,
+    rng_state: u32,
+    repeat_window: usize,
+    repeat_penalty: f32,
+    exit_threshold: f32,       // max softmax prob threshold (e.g., 0.9)
+    checkpoint_layers: &[usize], // which layers to check (e.g., &[12, 24])
+) -> HipResult<(u32, u32, usize)> {
+    // Embed
+    forward_scratch_embed(gpu, weights, config, token, pos, scratch)?;
+
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+
+    let mut exit_layer = config.n_layers;
+
+    for layer_idx in 0..config.n_layers {
+        let layer = &weights.layers[layer_idx];
+
+        // Standard layer computation (same as forward_scratch_layers)
+        gpu.rmsnorm_f32(&scratch.x, &layer.attn_norm, &scratch.tmp, config.norm_eps)?;
+
+        if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
+            gpu.fused_qkv_q4k(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &scratch.tmp, &scratch.q, &scratch.k, &scratch.v,
+                layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.wq, &scratch.tmp, &scratch.q)?;
+            weight_gemv(gpu, &layer.wk, &scratch.tmp, &scratch.k)?;
+            weight_gemv(gpu, &layer.wv, &scratch.tmp, &scratch.v)?;
+        }
+
+        if config.has_qk_norm {
+            if let Some(ref qn) = layer.q_norm {
+                gpu.rmsnorm_batched(&scratch.q, qn, &scratch.q, n_heads, head_dim, config.norm_eps)?;
+            }
+            if let Some(ref kn) = layer.k_norm {
+                gpu.rmsnorm_batched(&scratch.k, kn, &scratch.k, n_kv_heads, head_dim, config.norm_eps)?;
+            }
+        }
+
+        gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
+
+        // KV write + attention (use same dispatch as forward_scratch_layers)
+        if kv_cache.quant_turbo > 0 && kv_cache.turbo_adaptive
+                 && (layer_idx == 0 || layer_idx == config.n_layers - 1) {
+            gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
+            gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
+            gpu.attention_f32(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else if kv_cache.quantized && kv_cache.quant_q8 {
+            gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_q8_0_kv(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        } else {
+            gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
+            gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
+            gpu.attention_f32(
+                &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            )?;
+        }
+
+        weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
+        gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
+
+        gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
+        if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
+            gpu.fused_gate_up_q4k(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &scratch.tmp, &scratch.gate, &scratch.up,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.w_gate, &scratch.tmp, &scratch.gate)?;
+            weight_gemv(gpu, &layer.w_up, &scratch.tmp, &scratch.up)?;
+        }
+
+        gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
+        weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
+        gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+
+        // Early exit check at checkpoint layers
+        if checkpoint_layers.contains(&layer_idx) && exit_threshold > 0.0 {
+            // Compute logits from intermediate hidden state
+            gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
+            weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+
+            // GPU-side argmax to find max logit, download just the max value
+            // For now: download logits and check on CPU (optimize later)
+            let logits = gpu.download_f32(&scratch.logits)?;
+            let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let sum_exp: f64 = logits.iter().map(|&l| ((l - max_logit) as f64).exp()).sum();
+            let max_prob = (1.0 / sum_exp) as f32; // prob of argmax token
+
+            if max_prob >= exit_threshold {
+                exit_layer = layer_idx + 1;
+                // Sample from these logits
+                let (tok, rng) = gpu.sample_top_p(
+                    &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
+                    config.vocab_size, temperature, top_p, rng_state,
+                    repeat_window, repeat_penalty,
+                )?;
+                return Ok((tok, rng, exit_layer));
+            }
+        }
+    }
+
+    // No early exit — run full final norm + logits + sampling
+    gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
+    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    let (tok, rng) = gpu.sample_top_p(
+        &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
+        config.vocab_size, temperature, top_p, rng_state,
+        repeat_window, repeat_penalty,
+    )?;
+    Ok((tok, rng, exit_layer))
+}
+
 /// Layer loop + final norm + logits only (no sampling). Graph-capturable.
 pub fn forward_scratch_compute(
     gpu: &mut Gpu,
